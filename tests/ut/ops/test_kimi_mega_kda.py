@@ -60,6 +60,31 @@ def runtime():
         "torch_npu": SimpleNamespace(npu_format_cast=lambda x, fmt: x),
         "ACL_FORMAT_FRACTAL_ND": 2,
         "MEGA_KDA_ABI_POSITIONAL_ARGS": 20,
+        "MEGA_KDA_REPLAY_ABI_REQUIRED_ARGS": (
+            "hidden_states",
+            "qkv_projection_weight",
+            "decay_projection_a_weight",
+            "decay_projection_b_weight",
+            "beta_projection_weight",
+            "output_gate_projection_weight",
+            "output_norm_weight",
+            "output_projection_weight",
+            "conv1d_weight",
+            "conv_state",
+            "checkpoint_state",
+            "replay_u",
+            "replay_k",
+            "replay_decay",
+            "state_indices",
+            "conv_num_accepted_tokens",
+            "A_log",
+            "dt_bias",
+            "scale",
+            "lower_bound",
+            "rms_norm_eps",
+            "cu_seqlens",
+            "max_batch",
+        ),
         "MEGA_KDA_CACHE_ALIGNMENT_BYTES": 16,
         "NULL_BLOCK_ID": 0,
     }
@@ -648,6 +673,16 @@ def test_operator_loader_rejects_19_argument_abi(runtime):
     with pytest.raises(ImportError, match="20-argument") as error:
         runtime["load_mega_kda_operator"]()
     assert error.value.__cause__ is original
+
+
+def test_operator_loader_accepts_replayssm_keyword_abi(runtime):
+    namespace = {}
+    exec(
+        "def replay(" + ",".join(runtime["MEGA_KDA_REPLAY_ABI_REQUIRED_ARGS"]) + "): pass",
+        namespace,
+    )
+    runtime["import_module"].return_value = SimpleNamespace(mega_recurrent_kda=namespace["replay"])
+    assert runtime["load_mega_kda_operator"](replayssm=True) is namespace["replay"]
 
 
 def test_config_validation_is_kimi_only(runtime):

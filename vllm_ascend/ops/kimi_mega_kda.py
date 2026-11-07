@@ -4,12 +4,12 @@
 
 ``mega_recurrent_kda`` (external ``ops`` package) fuses the KDA input
 projections, causal conv1d update, recurrent KDA, gated output norm and
-output projection into a single launch.  The 20-argument ABI reads BF16
-``[out, in]`` weights pre-cast to NZ format and a
-``[3, heads, conv_size, head_dim]`` conv weight; state indices and
-accepted-token counts are int32 and ``ssm_state_indices`` is flattened to
-``[batch * spec_len]``. The first Verify round after prefill uses ``conv=S``;
-the recurrent count always comes from scheduler metadata, as in PR #6.
+output projection into a single launch.  The legacy 20-argument ABI reads
+BF16 ``[out, in]`` weights pre-cast to NZ format.  The ReplaySSM ABI extends
+it with checkpoint and replay buffers and uses keyword arguments; state
+indices and accepted-token counts are int32. The first Verify round after
+prefill uses ``conv=S``; the recurrent count always comes from scheduler
+metadata, as in PR #6.
 """
 
 from dataclasses import dataclass
@@ -24,6 +24,31 @@ from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND
 
 MEGA_KDA_NZ_FORMAT = 29
 MEGA_KDA_ABI_POSITIONAL_ARGS = 20
+MEGA_KDA_REPLAY_ABI_REQUIRED_ARGS = (
+    "hidden_states",
+    "qkv_projection_weight",
+    "decay_projection_a_weight",
+    "decay_projection_b_weight",
+    "beta_projection_weight",
+    "output_gate_projection_weight",
+    "output_norm_weight",
+    "output_projection_weight",
+    "conv1d_weight",
+    "conv_state",
+    "checkpoint_state",
+    "replay_u",
+    "replay_k",
+    "replay_decay",
+    "state_indices",
+    "conv_num_accepted_tokens",
+    "A_log",
+    "dt_bias",
+    "scale",
+    "lower_bound",
+    "rms_norm_eps",
+    "cu_seqlens",
+    "max_batch",
+)
 MEGA_KDA_CACHE_ALIGNMENT_BYTES = 16
 
 
@@ -340,8 +365,8 @@ class MegaKDAWeights:
     conv: torch.Tensor
 
 
-def load_mega_kda_operator():
-    """Load the PR #6 ABI only when explicitly enabled by the user.
+def load_mega_kda_operator(*, replayssm: bool = False):
+    """Load the MegaKDA operator for the selected ABI.
 
     Import/extension failures retain their original exception as the cause.
     No trial execution is allowed: the operator mutates both state caches.
@@ -349,9 +374,13 @@ def load_mega_kda_operator():
     try:
         operator = import_module("ops.mega_recurrent_kda").mega_recurrent_kda
     except (ImportError, AttributeError) as error:
+        abi = (
+            "the ReplaySSM keyword ABI (including replay_u/replay_k/replay_decay)"
+            if replayssm
+            else "the PR #6 20-argument BF16/NZ ABI (including RMS epsilon)"
+        )
         raise ImportError(
-            "enable_mega_kda requires ops.mega_recurrent_kda.mega_recurrent_kda "
-            "with the PR #6 20-argument BF16/NZ ABI (including RMS epsilon)."
+            f"enable_mega_kda requires ops.mega_recurrent_kda.mega_recurrent_kda with {abi}."
         ) from error
     if not callable(operator):
         raise TypeError("ops.mega_recurrent_kda.mega_recurrent_kda must be callable")
@@ -360,8 +389,16 @@ def load_mega_kda_operator():
     except (TypeError, ValueError):
         parameters = ()  # Some binary exports expose no Python signature.
     if parameters and not any(p.kind is Parameter.VAR_POSITIONAL for p in parameters):
+        parameter_names = {p.name for p in parameters}
         positional = [p for p in parameters if p.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)]
-        if len(positional) != MEGA_KDA_ABI_POSITIONAL_ARGS:
+        if replayssm:
+            missing = [name for name in MEGA_KDA_REPLAY_ABI_REQUIRED_ARGS if name not in parameter_names]
+            if missing:
+                raise RuntimeError(
+                    "MegaKDA ReplaySSM ABI mismatch: the operator is missing required parameters "
+                    f"{missing}; got {signature(operator)}."
+                )
+        elif len(positional) != MEGA_KDA_ABI_POSITIONAL_ARGS:
             raise RuntimeError(
                 "MegaKDA ABI mismatch: expected the PR #6 20-argument BF16/NZ export, "
                 f"got {signature(operator)}. The 19-argument ND recipe ABI is incompatible."

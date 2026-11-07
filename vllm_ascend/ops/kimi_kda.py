@@ -296,7 +296,6 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             (getattr(vllm_config, "additional_config", None) or {}).get("enable_mega_kda", False),
             "additional_config.enable_mega_kda",
         )
-        self._mega_operator = load_mega_kda_operator() if self.use_mega_kda else None
         self.use_mega_kda_replayssm = validate_additional_config_bool(
             (getattr(vllm_config, "additional_config", None) or {}).get("enable_mega_kda_replayssm", False),
             "additional_config.enable_mega_kda_replayssm",
@@ -305,6 +304,9 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             raise ValueError("enable_mega_kda_replayssm requires enable_mega_kda")
         if self.use_mega_kda_replayssm and not bool(getattr(vllm_config, "use_v2_model_runner", False)):
             raise ValueError("enable_mega_kda_replayssm requires VLLM_USE_V2_MODEL_RUNNER=1")
+        self._mega_operator = (
+            load_mega_kda_operator(replayssm=self.use_mega_kda_replayssm) if self.use_mega_kda else None
+        )
         self._commit_operator = load_commit_recurrent_kda_operator() if self.use_mega_kda_replayssm else None
         quant_config = getattr(vllm_config, "quant_config", None)
         uses_mixed_projection = bool(
