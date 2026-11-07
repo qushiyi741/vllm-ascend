@@ -837,8 +837,18 @@ class InputValidation:
     def validate_commit_values(a):
         indices = a['state_indices'].detach().cpu().tolist()
         InputValidation._bounded(indices, 0, a['checkpoint_state'].shape[0] - 1, 'state_indices')
-        InputValidation.require(len(indices) == len(set(indices)), 'state_indices must be distinct across batch')
-        InputValidation._bounded(a['num_accepted_tokens'].detach().cpu().tolist(), 0, a['replay_u'].shape[2], 'num_accepted_tokens')
+        accepted = a['num_accepted_tokens'].detach().cpu().tolist()
+        InputValidation._bounded(accepted, 0, a['replay_u'].shape[2], 'num_accepted_tokens')
+        # FULL graph batches contain padded/null rows.  Those rows may reuse
+        # the same state slot, but they have no accepted records and therefore
+        # do not write checkpoint_state.  Only active rows must be disjoint;
+        # retaining this check catches real concurrent writes while allowing
+        # static graph padding to pass validation.
+        active_indices = [index for index, count in zip(indices, accepted) if count > 0]
+        InputValidation.require(
+            len(active_indices) == len(set(active_indices)),
+            'state_indices must be distinct across active batch rows',
+        )
 
     @staticmethod
     def validate_aliases(tensors, writable):
@@ -938,7 +948,8 @@ def commit_recurrent_kda(checkpoint_state:torch.Tensor,replay_u:torch.Tensor,rep
         replay_k (Tensor): Read-only FP16 [max_batch,N,S,128].
         replay_decay (Tensor): Read-only FP32 [max_batch,N,S,128].
         num_accepted_tokens (Tensor): INT32 [B], every value in [0,S].
-        state_indices (Tensor): INT32 [B], distinct paged-state slots; slot zero is valid.
+        state_indices (Tensor): INT32 [B], distinct paged-state slots for active
+        rows; inactive graph-padding rows may reuse a slot. Slot zero is valid.
         block_num (int|None): AIC quota 8/24/28/32; None selects current-stream maximum.
         max_batch (int): Record capacity, default 512.
     Returns:
