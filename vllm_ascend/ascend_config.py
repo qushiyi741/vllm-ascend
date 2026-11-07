@@ -435,6 +435,7 @@ class AscendConfig:
             "draft_window_size": null,
             "mix_placement": false,
             "enable_mega_kda": false,
+            "enable_mega_kda_replayssm": false,
             "pa_shape_list": [],
             "mega_moe_max_tokens": 65536,
             "ascend_log_path": "~/ascend/log/vllm_ascend",
@@ -586,6 +587,10 @@ class AscendConfig:
     # Opt-in external MegaKDA decode/verify operator for Kimi K3.
     # Disabled by default so existing models keep their current path.
     enable_mega_kda: bool = False
+    # Use the ReplaySSM ABI (commit_recurrent_kda + keyword MegaKDA ABI).
+    # This is an Ascend-specific switch and is intentionally independent of
+    # vLLM's generic cache_config.use_replayssm setting.
+    enable_mega_kda_replayssm: bool = False
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
     # value (e.g. 4 = MXFP float8_e4m3 communication quantization) regardless of the
     # model's quant_type, 0 means disabled (use the model's own quant).
@@ -977,6 +982,11 @@ class AscendConfig:
 
     def _validate_mega_kda(self, vllm_config: VllmConfig) -> None:
         """Validate the opt-in MegaKDA switch against the model config."""
+        replay_enabled = bool(getattr(self, "enable_mega_kda_replayssm", False))
+        if replay_enabled and not self.enable_mega_kda:
+            raise ValueError("additional_config.enable_mega_kda_replayssm requires enable_mega_kda=true.")
+        if replay_enabled and not bool(getattr(vllm_config, "use_v2_model_runner", False)):
+            raise ValueError("additional_config.enable_mega_kda_replayssm requires VLLM_USE_V2_MODEL_RUNNER=1.")
         if not self.enable_mega_kda:
             return
         hf_config = getattr(vllm_config.model_config, "hf_text_config", None)

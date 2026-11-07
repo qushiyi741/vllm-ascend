@@ -69,11 +69,15 @@ class AscendMegaKDAMambaHybridAttnMetadata(MambaHybridAttnMetadata):
     """V2 request history survives align-mode physical block migration."""
 
     mega_first_verify: torch.Tensor | None = None
+    mega_request_indices: torch.Tensor | None = None
+    mega_commit_num_accepted_tokens: torch.Tensor | None = None
 
     def get_extra_attn_kwargs(self, attn_metadata_builder, num_reqs):
         kwargs = super().get_extra_attn_kwargs(attn_metadata_builder, num_reqs)
         if isinstance(attn_metadata_builder, AscendMegaKDAHostMetadataBuilder):
             kwargs["mega_first_verify"] = self.mega_first_verify
+            kwargs["mega_request_indices"] = self.mega_request_indices
+            kwargs["mega_commit_num_accepted_tokens"] = self.mega_commit_num_accepted_tokens
         return kwargs
 
 
@@ -97,7 +101,10 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         self._layer_state_ranges: dict[str, tuple[int, int]] | None = None
         self._pending_bulk_copy: tuple[MambaSpecDecodeGPUContext, int, torch.Tensor] | None = None
         self._mega_request_tracker = None
-        if (getattr(self.vllm_config, "additional_config", None) or {}).get("enable_mega_kda", False):
+        additional_config = getattr(self.vllm_config, "additional_config", None) or {}
+        if additional_config.get("enable_mega_kda", False) or additional_config.get(
+            "enable_mega_kda_replayssm", False
+        ):
             # Request index zero is real; shift it past the reserved null row.
             self._mega_request_tracker = MegaKDAFirstVerifyTracker(self.max_num_reqs + 1, self.device)
 
@@ -107,18 +114,40 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         if tracker is not None:
             tracker.context[req_index + 1 : req_index + 2].fill_(-1)
             tracker.first[req_index + 1 : req_index + 2].fill_(1)
+        static_context = getattr(self.vllm_config.compilation_config, "static_forward_context", None) or {}
+        for layer in static_context.values():
+            workspace = getattr(layer, "_mega_replay_workspace", None)
+            if workspace is not None:
+                workspace.invalidate_requests(req_index + 1)
 
     def _with_mega_request_history(self, input_batch, metadata, for_capture):
         tracker = getattr(self, "_mega_request_tracker", None)
-        if tracker is None or for_capture:
+        replay_enabled = bool(
+            (getattr(self.vllm_config, "additional_config", None) or {}).get(
+                "enable_mega_kda_replayssm", False
+            )
+        )
+        if (tracker is None and not replay_enabled) or for_capture:
             return metadata
         count = input_batch.num_reqs
         device = input_batch.seq_lens.device
         drafts = metadata.num_decode_draft_tokens_cpu
+        raw_indices = getattr(input_batch, "idx_mapping", None)
+        if raw_indices is None:
+            raw_indices = torch.arange(count, dtype=torch.int64, device=device)
+        else:
+            raw_indices = raw_indices[:count].to(torch.int64)
+        valid_indices = raw_indices >= 0
+        request_indices = torch.where(
+            valid_indices,
+            raw_indices + 1,
+            torch.zeros_like(raw_indices, dtype=torch.int64),
+        ).to(torch.int64)
         if getattr(input_batch, "is_dummy", False):
             # Eager/PIECEWISE profiling and idle DP runs must not consume
             # request history even when their dummy indices name live slots.
             first = torch.zeros(count, dtype=torch.int32, device=device)
+            commit_accepted = torch.zeros(count, dtype=torch.int32, device=device)
         else:
             query_lens = torch.diff(input_batch.query_start_loc[: count + 1])
             spec_mask = (
@@ -127,16 +156,21 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
                 else (drafts[:count] >= 0).to(device=device, non_blocking=True)
             )
             first = tracker.update(
-                input_batch.idx_mapping[:count] + 1,
+                raw_indices + 1,
                 input_batch.seq_lens[:count] - query_lens,
                 metadata.is_prefilling[:count].to(device=device, non_blocking=True),
                 spec_mask,
             )
+            safe_indices = raw_indices.clamp_min(0)
+            commit_accepted = self.num_accepted_tokens_gpu[safe_indices].to(torch.int32)
+            commit_accepted = torch.where(valid_indices, commit_accepted, torch.zeros_like(commit_accepted))
         return AscendMegaKDAMambaHybridAttnMetadata(
             is_prefilling=metadata.is_prefilling,
             num_accepted_tokens=metadata.num_accepted_tokens,
             num_decode_draft_tokens_cpu=drafts,
             mega_first_verify=first,
+            mega_request_indices=request_indices,
+            mega_commit_num_accepted_tokens=commit_accepted,
         )
 
     def _get_layer_state_ranges(self, kv_cache_config: KVCacheConfig) -> dict[str, tuple[int, int]]:

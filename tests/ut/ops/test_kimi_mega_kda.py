@@ -69,6 +69,7 @@ def runtime():
             "MegaKDAWeights",
             "MegaKDAFirstVerifyTracker",
             "MegaKDACacheWorkspace",
+            "MegaKDAReplayWorkspace",
             "MegaKDAPagedBatch",
             "MegaKDAPagedCache",
             "_mega_cache_layout",
@@ -201,6 +202,35 @@ def test_weights_slice_packed_projection_and_preserve_source(runtime):
     assert weights.conv.shape == (3, 2, 4, 4)
     assert weights.o_norm.dtype == torch.float32
     torch.testing.assert_close(packed, before)
+
+
+def test_replay_workspace_is_request_indexed_and_reorders_rows(runtime):
+    workspace = runtime["MegaKDAReplayWorkspace"](
+        max_batch=4,
+        max_request_slots=3,
+        spec_len=8,
+        num_heads=2,
+        head_dim=4,
+        device="cpu",
+    )
+    request_indices = torch.tensor([1, 2, 0, 3], dtype=torch.int64)
+    accepted = torch.ones(4, dtype=torch.int32)
+    assert workspace.prepare(request_indices, 4, accepted).tolist() == [0, 0, 0, 0]
+    workspace.replay_u[0].fill_(2.0)
+    workspace.replay_k[0].fill_(3.0)
+    workspace.replay_decay[0].fill_(4.0)
+    workspace.record_done(4)
+
+    # The next scheduler step swaps request rows. History follows request id,
+    # rather than the old batch row.
+    accepted = workspace.prepare(torch.tensor([2, 1], dtype=torch.int64), 2, accepted)
+    assert accepted.tolist() == [0, 1]
+    torch.testing.assert_close(workspace.replay_u[1], torch.full_like(workspace.replay_u[1], 2.0))
+    torch.testing.assert_close(workspace.replay_k[1], torch.full_like(workspace.replay_k[1], 3.0))
+    torch.testing.assert_close(workspace.replay_decay[1], torch.full_like(workspace.replay_decay[1], 4.0))
+
+    workspace.invalidate_requests(1)
+    assert workspace.prepare(torch.tensor([1], dtype=torch.int64), 1, torch.ones(1, dtype=torch.int32)).item() == 0
 
 
 def test_mixed_projection_uses_original_factors(runtime):
