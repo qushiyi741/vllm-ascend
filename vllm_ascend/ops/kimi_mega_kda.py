@@ -370,15 +370,22 @@ def load_mega_kda_operator():
 
 
 def load_commit_recurrent_kda_operator():
-    """Load the ReplaySSM checkpoint commit operator."""
+    """Load the vendored ReplaySSM checkpoint commit operator.
+
+    The kernel source is shipped with vllm-ascend because the runtime package
+    does not expose ``ops.commit_recurrent_kda`` as an importable module.
+    Keep this import lazy: cannbotdsl is only required when ReplaySSM is
+    explicitly enabled.
+    """
     try:
-        operator = import_module("ops.commit_recurrent_kda").commit_recurrent_kda
+        operator = import_module("vllm_ascend.ops.commit_recurrent_kda").commit_recurrent_kda
     except (ImportError, AttributeError) as error:
         raise ImportError(
-            "enable_mega_kda_replayssm requires ops.commit_recurrent_kda.commit_recurrent_kda"
+            "enable_mega_kda_replayssm requires the vendored "
+            "vllm_ascend.ops.commit_recurrent_kda source and its cannbotdsl dependencies"
         ) from error
     if not callable(operator):
-        raise TypeError("ops.commit_recurrent_kda.commit_recurrent_kda must be callable")
+        raise TypeError("vllm_ascend.ops.commit_recurrent_kda.commit_recurrent_kda must be callable")
     return operator
 
 
