@@ -1453,6 +1453,31 @@ class AscendKimiK3ForConditionalGeneration(UpstreamKimiK3ForConditionalGeneratio
     def get_language_model(self) -> AscendKimiLinearForCausalLM:
         return self.language_model
 
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
+        """Delegate to the Ascend text model, not the upstream one.
+
+        ``Platform._align_mamba_and_attn_page_size`` resolves this hook on the
+        configured architecture (this VL class) to size the Mamba page before
+        the KV cache is allocated. The upstream delegator targets
+        ``vllm.models.kimi_k3.nvidia.model.KimiLinearForCausalLM``, which does
+        not know about the Ascend ReplaySSM states; the worker would then build
+        a larger MambaSpec than ``cache_config.mamba_page_size_padded`` and the
+        page-size assertion would fire.
+        """
+        text_config = vllm_config.model_config.hf_config.text_config
+        return AscendKimiLinearForCausalLM.get_mamba_state_dtype_from_config(
+            vllm_config.with_hf_config(text_config)
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
+        """Delegate to the Ascend text model; see the dtype hook above."""
+        text_config = vllm_config.model_config.hf_config.text_config
+        return AscendKimiLinearForCausalLM.get_mamba_state_shape_from_config(
+            vllm_config.with_hf_config(text_config)
+        )
+
     def process_weights_after_loading(self) -> None:
         # The loader invokes only the outer model-level hook for VL models.
         self.language_model.process_weights_after_loading()
