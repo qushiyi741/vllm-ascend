@@ -1192,7 +1192,8 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             is_preprocessed=beta_is_preprocessed,
         )
 
-        conv_state, recurrent_state = self.kv_cache
+        # ReplaySSM stores three record states after conv/checkpoint.
+        conv_state, recurrent_state = self.kv_cache[:2]
         conv_weights_t = self.get_parameter(_PACKED_CONV_WEIGHT_NAME)
         spec_masks = attn_metadata.spec_sequence_masks
         spec_token_indices = attn_metadata.spec_token_indx
