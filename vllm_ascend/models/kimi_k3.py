@@ -34,6 +34,10 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -1252,6 +1256,50 @@ class AscendKimiLinearForCausalLM(UpstreamKimiLinearForCausalLM, KimiMixtureOfEx
     """Causal-LM wrapper retaining vLLM 0.27 state/cache interfaces."""
 
     packed_modules_mapping = AscendKimiLinearModel.packed_modules_mapping
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
+        """Return the Ascend MegaKDA page state dtypes.
+
+        The upstream Kimi class only describes conv/checkpoint (and its
+        CUDA RecoverSSM records). ReplaySSM is an Ascend-only ABI, so its
+        three page records must be included here before KV cache allocation.
+        """
+        hf_config = vllm_config.model_config.hf_config
+        base = MambaStateDtypeCalculator.kda_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+        additional = getattr(vllm_config, "additional_config", None) or {}
+        enabled = bool(additional.get("enable_mega_kda_replayssm", False))
+        if not enabled:
+            return base
+        return (*base, torch.float32, torch.float16, torch.float32)
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
+        hf_config = vllm_config.model_config.hf_config
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        base = MambaStateShapeCalculator.kda_state_shape(
+            tp_size,
+            hf_config.linear_attn_config["num_heads"],
+            hf_config.linear_attn_config["head_dim"],
+            conv_kernel_size=hf_config.linear_attn_config["short_conv_kernel_size"],
+            num_spec=num_spec,
+        )
+        additional = getattr(vllm_config, "additional_config", None) or {}
+        enabled = bool(additional.get("enable_mega_kda_replayssm", False))
+        if not enabled:
+            return base
+        local_heads = hf_config.linear_attn_config["num_heads"] // tp_size
+        record = (local_heads, 1 + num_spec, hf_config.linear_attn_config["head_dim"])
+        return (*base, record, record, record)
 
     def process_weights_after_loading(self) -> None:
         # vLLM invokes this model hook after every per-module quant finalizer,

@@ -47,7 +47,6 @@ MEGA_KDA_REPLAY_ABI_REQUIRED_ARGS = (
     "lower_bound",
     "rms_norm_eps",
     "cu_seqlens",
-    "max_batch",
 )
 MEGA_KDA_CACHE_ALIGNMENT_BYTES = 16
 
@@ -114,59 +113,6 @@ class MegaKDACacheWorkspace:
         self.conv_indices = torch.arange(1, max_batch + 1, dtype=torch.int32, device=device)
         self.recurrent_indices = torch.arange(1, max_batch * spec_len + 1, dtype=torch.int32, device=device)
         self.copy_flags = torch.ones(max_batch * spec_len, dtype=torch.bool, device=device)
-
-
-class MegaKDAReplayWorkspace:
-    """ReplaySSM ABI buffers and request-indexed history for one KDA layer.
-
-    The native Replay ABI addresses the three replay tensors by batch row and
-    only consumes the first ``batch`` rows.  vLLM is free to reorder rows
-    between scheduler steps, so the durable copy is keyed by request state
-    index and gathered into the ABI tensors before each layer invocation.
-    Row zero is reserved for graph padding/null requests.
-    """
-
-    def __init__(self, max_batch, max_request_slots, spec_len, num_heads, head_dim, device):
-        record_shape = (num_heads, spec_len, head_dim)
-        self.replay_u = torch.zeros((max_batch, *record_shape), dtype=torch.float32, device=device)
-        self.replay_k = torch.zeros((max_batch, *record_shape), dtype=torch.float16, device=device)
-        self.replay_decay = torch.zeros((max_batch, *record_shape), dtype=torch.float32, device=device)
-        self.request_u = torch.zeros((max_request_slots + 1, *record_shape), dtype=torch.float32, device=device)
-        self.request_k = torch.zeros((max_request_slots + 1, *record_shape), dtype=torch.float16, device=device)
-        self.request_decay = torch.zeros((max_request_slots + 1, *record_shape), dtype=torch.float32, device=device)
-        self.request_valid = torch.zeros(max_request_slots + 1, dtype=torch.bool, device=device)
-        self.request_indices = torch.zeros(max_batch, dtype=torch.int64, device=device)
-
-    def invalidate_requests(self, request_indices: torch.Tensor | int) -> None:
-        if isinstance(request_indices, int):
-            request_indices = torch.tensor([request_indices], device=self.request_valid.device)
-        indices = request_indices.to(device=self.request_valid.device, dtype=torch.int64)
-        indices = indices.clamp(0, self.request_valid.numel() - 1)
-        self.request_valid.index_fill_(0, indices, False)
-        self.request_u.index_fill_(0, indices, 0)
-        self.request_k.index_fill_(0, indices, 0)
-        self.request_decay.index_fill_(0, indices, 0)
-
-    def prepare(self, request_indices: torch.Tensor, batch: int, accepted: torch.Tensor) -> torch.Tensor:
-        indices = request_indices[:batch].to(device=self.request_valid.device, dtype=torch.int64)
-        self.request_indices[:batch].copy_(indices)
-        safe = indices.clamp(0, self.request_valid.numel() - 1)
-        torch.index_select(self.request_u, 0, safe, out=self.replay_u[:batch])
-        torch.index_select(self.request_k, 0, safe, out=self.replay_k[:batch])
-        torch.index_select(self.request_decay, 0, safe, out=self.replay_decay[:batch])
-        valid = torch.index_select(self.request_valid, 0, safe)
-        return torch.where(valid, accepted[:batch].to(torch.int32), torch.zeros_like(accepted[:batch], dtype=torch.int32))
-
-    def commit_done(self, batch: int) -> None:
-        indices = self.request_indices[:batch]
-        self.request_valid.index_copy_(0, indices, torch.zeros(batch, dtype=torch.bool, device=indices.device))
-
-    def record_done(self, batch: int) -> None:
-        indices = self.request_indices[:batch]
-        self.request_u.index_copy_(0, indices, self.replay_u[:batch])
-        self.request_k.index_copy_(0, indices, self.replay_k[:batch])
-        self.request_decay.index_copy_(0, indices, self.replay_decay[:batch])
-        self.request_valid.index_copy_(0, indices, indices > 0)
 
 
 @dataclass(frozen=True)
@@ -407,22 +353,15 @@ def load_mega_kda_operator(*, replayssm: bool = False):
 
 
 def load_commit_recurrent_kda_operator():
-    """Load the vendored ReplaySSM checkpoint commit operator.
-
-    The kernel source is shipped with vllm-ascend because the runtime package
-    does not expose ``ops.commit_recurrent_kda`` as an importable module.
-    Keep this import lazy: cannbotdsl is only required when ReplaySSM is
-    explicitly enabled.
-    """
+    """Load the ReplaySSM checkpoint commit operator from the runtime package."""
     try:
-        operator = import_module("vllm_ascend.ops.commit_recurrent_kda").commit_recurrent_kda
+        operator = import_module("ops.commit_recurrent_kda").commit_recurrent_kda
     except (ImportError, AttributeError) as error:
         raise ImportError(
-            "enable_mega_kda_replayssm requires the vendored "
-            "vllm_ascend.ops.commit_recurrent_kda source and its cannbotdsl dependencies"
+            "enable_mega_kda_replayssm requires ops.commit_recurrent_kda.commit_recurrent_kda"
         ) from error
     if not callable(operator):
-        raise TypeError("vllm_ascend.ops.commit_recurrent_kda.commit_recurrent_kda must be callable")
+        raise TypeError("ops.commit_recurrent_kda.commit_recurrent_kda must be callable")
     return operator
 
 
@@ -465,7 +404,9 @@ def run_mega_recurrent_kda(
     o_norm_variance_epsilon: float,
     *,
     operator,
-    replay: MegaKDAReplayWorkspace | None = None,
+    replay_u: torch.Tensor | None = None,
+    replay_k: torch.Tensor | None = None,
+    replay_decay: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the fused Mega-KDA decode operator for one KDA layer.
 
@@ -473,7 +414,9 @@ def run_mega_recurrent_kda(
     the partial (pre-TP-reduction) ``[batch * spec_len, hidden]`` output with
     the output projection already applied.
     """
-    if replay is None:
+    if replay_u is None:
+        if replay_k is not None or replay_decay is not None:
+            raise ValueError("replay_u, replay_k and replay_decay must be provided together")
         output = operator(
             hidden_states,
             weights.qkv,
@@ -497,6 +440,8 @@ def run_mega_recurrent_kda(
             o_norm_variance_epsilon,
         )
     else:
+        if replay_k is None or replay_decay is None:
+            raise ValueError("replay_u, replay_k and replay_decay must be provided together")
         output = operator(
             hidden_states=hidden_states,
             qkv_projection_weight=weights.qkv,
@@ -509,9 +454,9 @@ def run_mega_recurrent_kda(
             conv1d_weight=weights.conv,
             conv_state=conv_state,
             checkpoint_state=recurrent_state,
-            replay_u=replay.replay_u,
-            replay_k=replay.replay_k,
-            replay_decay=replay.replay_decay,
+            replay_u=replay_u,
+            replay_k=replay_k,
+            replay_decay=replay_decay,
             state_indices=_as_int32_contiguous(conv_state_block_ids),
             conv_num_accepted_tokens=_as_int32_contiguous(conv_num_accepted_tokens),
             A_log=a_log,
@@ -520,7 +465,6 @@ def run_mega_recurrent_kda(
             lower_bound=gate_lower_bound,
             rms_norm_eps=o_norm_variance_epsilon,
             cu_seqlens=None,
-            max_batch=replay.replay_u.shape[0],
         )
         if isinstance(output, (tuple, list)):
             output = output[0]
@@ -531,7 +475,9 @@ def run_mega_recurrent_kda(
 
 def run_commit_recurrent_kda(
     checkpoint_state: torch.Tensor,
-    replay: MegaKDAReplayWorkspace,
+    replay_u: torch.Tensor,
+    replay_k: torch.Tensor,
+    replay_decay: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
     state_indices: torch.Tensor,
     *,
@@ -540,10 +486,9 @@ def run_commit_recurrent_kda(
     """Apply accepted ReplaySSM records to the canonical checkpoint state."""
     operator(
         checkpoint_state=checkpoint_state,
-        replay_u=replay.replay_u,
-        replay_k=replay.replay_k,
-        replay_decay=replay.replay_decay,
+        replay_u=replay_u,
+        replay_k=replay_k,
+        replay_decay=replay_decay,
         num_accepted_tokens=_as_int32_contiguous(num_accepted_tokens),
         state_indices=_as_int32_contiguous(state_indices),
-        max_batch=replay.replay_u.shape[0],
     )

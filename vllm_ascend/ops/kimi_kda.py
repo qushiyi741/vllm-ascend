@@ -23,6 +23,10 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+)
 from vllm.model_executor.utils import replace_parameter
 from vllm.models.kimi_k3.nvidia.kda import (
     KimiK3DeltaAttention,
@@ -44,7 +48,6 @@ from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBackend, Ascen
 from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
 from vllm_ascend.ops.kimi_mega_kda import (
     MegaKDACacheWorkspace,
-    MegaKDAReplayWorkspace,
     MegaKDAWeights,
     ensure_mega_kda_bf16,
     ensure_mega_kda_nd,
@@ -219,10 +222,11 @@ class _MegaKDAPlan:
 @dataclass(frozen=True)
 class _MegaKDAReplayPlan:
     batch: int
-    request_indices: torch.Tensor
     state_indices: torch.Tensor
     accepted_tokens: torch.Tensor
-    replay: MegaKDAReplayWorkspace
+    replay_u: torch.Tensor
+    replay_k: torch.Tensor
+    replay_decay: torch.Tensor
 
 
 def _kimi_kda_with_output(
@@ -230,13 +234,11 @@ def _kimi_kda_with_output(
 ) -> None:
     # Keep runtime metadata and real cache pointers outside Dynamo/FakeTensor.
     layer = get_forward_context().no_compile_layers[layer_name]
-    replay_plan = layer._prepare_mega_replayssm()
     plan = layer._plan_mega_kda(hidden_states)
     if plan is None:
-        if replay_plan is not None:
-            replay_plan.replay.commit_done(replay_plan.batch)
         output.copy_(layer._forward_default(hidden_states, positions))
     else:
+        replay_plan = layer._prepare_mega_replayssm()
         layer._forward_mega_kda(hidden_states, positions, plan, output, replay_plan)
 
 
@@ -250,12 +252,10 @@ def _kimi_kda(hidden_states: torch.Tensor, positions: torch.Tensor, layer_name: 
     # The ordinary FULL/eager path can return the external operator's fresh
     # result directly. Only breakable segments need a caller-owned buffer.
     layer = get_forward_context().no_compile_layers[layer_name]
-    replay_plan = layer._prepare_mega_replayssm()
     plan = layer._plan_mega_kda(hidden_states)
     if plan is None:
-        if replay_plan is not None:
-            replay_plan.replay.commit_done(replay_plan.batch)
         return layer._forward_default(hidden_states, positions)
+    replay_plan = layer._prepare_mega_replayssm()
     return layer._execute_mega_kda(hidden_states, positions, plan, replay_plan)
 
 
@@ -289,6 +289,33 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
     # Worker startup prepares this layer after KV-cache binding.
     _requires_kda_state_copy = True
 
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        # Build the canonical two-state KDA cache directly.  Upstream vLLM
+        # may enable its CUDA RecoverSSM records from speculative decoding;
+        # those records are unrelated to Ascend ReplaySSM and must not be
+        # mixed into the five-state MegaKDA cache ABI.
+        base = MambaStateDtypeCalculator.kda_state_dtype(
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
+        )
+        if not self.use_mega_kda_replayssm:
+            return base
+        return (*base, torch.float32, torch.float16, torch.float32)
+
+    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        base = MambaStateShapeCalculator.kda_state_shape(
+            self.tp_size,
+            self.num_heads,
+            self.head_dim,
+            conv_kernel_size=self.conv_size,
+            num_spec=self.num_spec,
+        )
+        if not self.use_mega_kda_replayssm:
+            return base
+        record = (self.local_num_heads, self.num_spec + 1, self.head_dim)
+        return (*base, record, record, record)
+
     def __init__(self, config, vllm_config, prefix: str = "") -> None:
         # Upstream asks for the backend during its constructor. Select a
         # separate metadata group so Qwen/GLM and draft layers are untouched.
@@ -318,6 +345,12 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             )(f"{prefix}.in_proj_qkvgfab")
         )
         super().__init__(config, vllm_config, prefix)
+        # The upstream CUDA RecoverSSM path owns two different auxiliary
+        # records and is incompatible with Ascend's three ReplaySSM pages.
+        # Keep the parent layer on the ordinary KDA path for prefill/fallback;
+        # ReplaySSM is driven only by the MegaKDA + commit operators below.
+        if self.use_mega_kda_replayssm:
+            self.use_recoverssm = False
         self.uses_mixed_projection = uses_mixed_projection
         self._ascend_kda_state_copy = None
         if uses_mixed_projection:
@@ -356,11 +389,9 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         self._mega_weight_signature: tuple | None = None
         self._mega_cache_workspace = None
         self._mega_cache_adapter = None
-        self._mega_replay_workspace = None
         self._mega_use_paged_cache = self.use_mega_kda and bool(getattr(vllm_config, "use_v2_model_runner", False))
         if self._mega_use_paged_cache:
             max_seqs = vllm_config.scheduler_config.max_num_seqs
-            self._mega_max_request_slots = max_seqs
             self._mega_max_batch = min(
                 ((max_seqs + self.tp_size - 1) // self.tp_size) * self.tp_size,
                 self.tp_size * _MEGA_KDA_MAX_BATCH_MULTIPLIER,
@@ -402,12 +433,9 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        replay_plan = None if torch.compiler.is_compiling() else self._prepare_mega_replayssm()
         if getattr(self, "use_mega_kda", False) and self._mega_weights is not None:
             custom_op = getattr(self.o_proj, "custom_op", None)
             if custom_op is not None and type(custom_op) is not KimiOProjMMReduceScatterOp:
-                if replay_plan is not None:
-                    replay_plan.replay.commit_done(replay_plan.batch)
                 return self._forward_default(hidden_states, positions)
             if torch.compiler.is_compiling():
                 if not is_breakable_cudagraph_enabled():
@@ -420,13 +448,12 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 return output
             plan = self._plan_mega_kda(hidden_states)
             if plan is not None:
+                replay_plan = None if torch.compiler.is_compiling() else self._prepare_mega_replayssm()
                 if not is_breakable_cudagraph_enabled():
                     return self._execute_mega_kda(hidden_states, positions, plan, replay_plan)
                 output = self._allocate_mega_output(hidden_states)
                 self._forward_mega_kda(hidden_states, positions, plan, output, replay_plan)
                 return output
-        if replay_plan is not None:
-            replay_plan.replay.commit_done(replay_plan.batch)
         return self._forward_default(hidden_states, positions)
 
     def _allocate_mega_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -437,7 +464,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
 
     def _prepare_mega_replayssm(self) -> _MegaKDAReplayPlan | None:
         """Prepare and commit the previous replay record for this layer."""
-        if not getattr(self, "use_mega_kda_replayssm", False) or self._mega_replay_workspace is None:
+        if not getattr(self, "use_mega_kda_replayssm", False):
             return None
         context = get_forward_context()
         raw = context.attn_metadata
@@ -446,8 +473,6 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         metadata = raw[self.prefix]
         if not isinstance(metadata, GDNAttentionMetadata):
             return None
-        request_indices = getattr(metadata, "mega_request_indices", None)
-        accepted = getattr(metadata, "mega_commit_num_accepted_tokens", None)
         if metadata.num_spec_decodes:
             state_table = metadata.spec_state_indices_tensor
             if state_table is None:
@@ -457,34 +482,35 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             state_indices = metadata.non_spec_state_indices_tensor
             if state_indices is None:
                 return None
-        batch = int(state_indices.shape[0])
-        if batch <= 0 or batch > self._mega_replay_workspace.replay_u.shape[0]:
+        if state_indices is None:
             return None
-        if request_indices is None:
-            request_indices = torch.zeros(batch, dtype=torch.int64, device=state_indices.device)
-        else:
-            request_indices = request_indices[:batch]
-        if accepted is None:
-            accepted = torch.zeros(batch, dtype=torch.int32, device=state_indices.device)
-        else:
-            accepted = accepted[:batch].to(torch.int32)
+        batch = int(state_indices.shape[0])
+        if batch <= 0 or len(self.kv_cache) != 5:
+            return None
+        accepted = (
+            metadata.num_accepted_tokens[:batch].to(torch.int32)
+            if metadata.num_spec_decodes and metadata.num_accepted_tokens is not None
+            else torch.ones(batch, dtype=torch.int32, device=state_indices.device)
+        )
+        replay_u, replay_k, replay_decay = self.kv_cache[2:5]
         # Connector/KV synchronization must precede Commit in align mode.
         wait_for_kv_layer_from_connector(self.prefix)
-        accepted = self._mega_replay_workspace.prepare(request_indices, batch, accepted)
         run_commit_recurrent_kda(
             self.kv_cache[1],
-            self._mega_replay_workspace,
+            replay_u,
+            replay_k,
+            replay_decay,
             accepted,
             state_indices,
             operator=self._commit_operator,
         )
-        self._mega_replay_workspace.commit_done(batch)
         return _MegaKDAReplayPlan(
             batch=batch,
-            request_indices=request_indices,
             state_indices=state_indices,
             accepted_tokens=accepted,
-            replay=self._mega_replay_workspace,
+            replay_u=replay_u,
+            replay_k=replay_k,
+            replay_decay=replay_decay,
         )
 
     def _forward_default(
@@ -622,9 +648,10 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
 
     def _mega_cache_supported(self, spec_len: int, batch: int = 1) -> bool:
         """Validate cache layout for either the dense or direct-stride ABI."""
-        if len(self.kv_cache) != 2:
+        expected_states = 5 if getattr(self, "use_mega_kda_replayssm", False) else 2
+        if len(self.kv_cache) != expected_states:
             return False
-        conv, recurrent = self.kv_cache
+        conv, recurrent = self.kv_cache[:2]
         shape_supported = (
             conv.ndim == 3
             and conv.shape[1] >= self.conv_size - 1 + spec_len - 1
@@ -642,7 +669,16 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             # Replay ABI reads the physical page tensors and obtains their
             # strides from the tensor descriptor.  Keep the innermost payload
             # contiguous, which is the layout guaranteed by the kernel docs.
-            return conv.stride(-1) == 1 and recurrent.stride(-1) == 1 and all(
+            replay_supported = all(
+                state.ndim == 4
+                and state.shape[0] == conv.shape[0]
+                and state.shape[1:] == (self.local_num_heads, self.num_spec + 1, self.head_dim)
+                and state.dtype == dtype
+                and state.stride(-1) == 1
+                and all(stride > 0 for stride in state.stride())
+                for state, dtype in zip(self.kv_cache[2:5], (torch.float32, torch.float16, torch.float32))
+            )
+            return replay_supported and conv.stride(-1) == 1 and recurrent.stride(-1) == 1 and all(
                 stride > 0 for stride in (*conv.stride(), *recurrent.stride())
             )
         return (conv.is_contiguous() and recurrent.is_contiguous()) or (
@@ -699,7 +735,6 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         self._requires_dense_kda_cache = False
         self._mega_cache_workspace = None
         self._mega_cache_adapter = None
-        self._mega_replay_workspace = None
         if not self.use_mega_kda:
             return False
         layers = (self.in_proj_qkvgfab, self.o_proj)
@@ -741,15 +776,6 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                     self._mega_max_batch, spec_len, conv_shape, recurrent_shape, self.in_proj_qkvgfab.weight.device
                 )
             self._mega_cache_workspace = workspaces[key]
-        if getattr(self, "use_mega_kda_replayssm", False):
-            self._mega_replay_workspace = MegaKDAReplayWorkspace(
-                max_batch=self._mega_max_batch,
-                max_request_slots=self._mega_max_request_slots,
-                spec_len=spec_len,
-                num_heads=self.local_num_heads,
-                head_dim=self.head_dim,
-                device=self.in_proj_qkvgfab.weight.device,
-            )
         # The Replay ABI consumes the physical page-strided state tensors and
         # obtains their strides from the descriptors.  Dense views are still
         # required by the legacy positional Mega ABI only.
@@ -801,7 +827,14 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
     ) -> torch.Tensor:
         if self._mega_weight_signature != self._current_mega_weight_signature():
             raise RuntimeError("MegaKDA weights changed; run the model process_weights_after_loading hook again")
-        conv_state, recurrent_state = self.kv_cache
+        conv_state, recurrent_state = self.kv_cache[:2]
+        replay_kwargs = {}
+        if replay_plan is not None:
+            replay_kwargs = {
+                "replay_u": replay_plan.replay_u,
+                "replay_k": replay_plan.replay_k,
+                "replay_decay": replay_plan.replay_decay,
+            }
         required_conv_state_len = self.conv_size - 1 + plan.spec_len - 1
         if (
             conv_state.ndim != 3
@@ -846,10 +879,8 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             gate_lower_bound=float(self.gate_lower_bound if self.gate_lower_bound is not None else -5.0),
             o_norm_variance_epsilon=float(self.o_norm.eps),
             operator=self._mega_operator,
-            replay=None if replay_plan is None else replay_plan.replay,
+            **replay_kwargs,
         )
-        if replay_plan is not None:
-            replay_plan.replay.record_done(replay_plan.batch)
         if paged_batch is not None:
             self._mega_cache_adapter.scatter(self.kv_cache, paged_batch)
         maybe_save_kv_layer_to_connector("", [])

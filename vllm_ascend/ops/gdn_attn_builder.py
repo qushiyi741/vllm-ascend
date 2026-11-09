@@ -1018,8 +1018,6 @@ class AscendMegaKDAHostMetadataBuilder(AscendGDNHostMetadataBuilder):
         self._mega_tracker = None
         self._mega_first_verify = torch.zeros_like(self.spec_sequence_indices, dtype=torch.int32)
         self._mega_conv_accepted = torch.empty_like(self.spec_sequence_indices, dtype=torch.int32)
-        self._mega_request_indices = torch.zeros_like(self.spec_sequence_indices, dtype=torch.int64)
-        self._mega_commit_num_accepted_tokens = torch.ones_like(self.spec_sequence_indices, dtype=torch.int32)
 
     def build_for_cudagraph_capture(self, common_attn_metadata, **kwargs):
         # Capture omits scheduler draft tokens, which would make _plan_mega_kda
@@ -1048,7 +1046,7 @@ class AscendMegaKDAHostMetadataBuilder(AscendGDNHostMetadataBuilder):
         layers = self.vllm_config.compilation_config.static_forward_context
         for name in self._mega_layer_names:
             cache = getattr(layers.get(name), "kv_cache", ())
-            if len(cache) == 2 and cache[0].ndim == 3 and cache[0].shape[0] > 0:
+            if len(cache) in (2, 5) and cache[0].ndim == 3 and cache[0].shape[0] > 0:
                 num_slots = cache[0].shape[0]
                 if self._mega_tracker is None or self._mega_tracker.context.numel() != num_slots:
                     self._mega_tracker = MegaKDAFirstVerifyTracker(num_slots, cache[0].device)
@@ -1064,8 +1062,6 @@ class AscendMegaKDAHostMetadataBuilder(AscendGDNHostMetadataBuilder):
         fast_build=False,
         num_actual_reqs=None,
         mega_first_verify=None,
-        mega_request_indices=None,
-        mega_commit_num_accepted_tokens=None,
     ):
         metadata = super().build(
             common_prefix_len,
@@ -1089,18 +1085,9 @@ class AscendMegaKDAHostMetadataBuilder(AscendGDNHostMetadataBuilder):
         # be established safely. Keep the existing KDA implementation.
         metadata.mega_first_verify = None
         metadata.mega_conv_accepted_tokens = None
-        metadata.mega_request_indices = None
-        metadata.mega_commit_num_accepted_tokens = None
         metadata.mega_has_folded_prefills = True
         metadata.mega_query_lens = ()
         if is_prefilling is None or (mega_first_verify is None and not self._ensure_mega_tracker()):
-            if mega_request_indices is not None:
-                metadata.mega_request_indices = mega_request_indices[:count]
-                metadata.mega_commit_num_accepted_tokens = (
-                    None
-                    if mega_commit_num_accepted_tokens is None
-                    else mega_commit_num_accepted_tokens[:count]
-                )
             return metadata
         metadata.mega_has_folded_prefills = bool(torch.any(is_prefilling & (query_lens > 0)))
         metadata.mega_query_lens = tuple(
@@ -1144,35 +1131,6 @@ class AscendMegaKDAHostMetadataBuilder(AscendGDNHostMetadataBuilder):
                 out=conv_accepted,
             )
             metadata.mega_conv_accepted_tokens = conv_accepted
-        if mega_request_indices is not None:
-            if metadata.num_spec_decodes:
-                graph_batch = metadata.spec_state_indices_tensor.shape[0]
-                request_indices = mega_request_indices[:count].index_select(
-                    0, self.spec_sequence_indices[: metadata.num_spec_decodes]
-                )
-                accepted = (
-                    torch.ones_like(request_indices, dtype=torch.int32)
-                    if mega_commit_num_accepted_tokens is None
-                    else mega_commit_num_accepted_tokens[:count].index_select(
-                        0, self.spec_sequence_indices[: metadata.num_spec_decodes]
-                    )
-                )
-            else:
-                graph_batch = metadata.non_spec_state_indices_tensor.shape[0]
-                request_indices = mega_request_indices[:count]
-                accepted = (
-                    torch.ones(graph_batch, dtype=torch.int32, device=request_indices.device)
-                    if mega_commit_num_accepted_tokens is None
-                    else mega_commit_num_accepted_tokens[:count]
-                )
-            request_buffer = self._mega_request_indices[:graph_batch]
-            accepted_buffer = self._mega_commit_num_accepted_tokens[:graph_batch]
-            request_buffer.zero_()
-            accepted_buffer.fill_(1)
-            request_buffer[: request_indices.shape[0]].copy_(request_indices)
-            accepted_buffer[: accepted.shape[0]].copy_(accepted)
-            metadata.mega_request_indices = request_buffer
-            metadata.mega_commit_num_accepted_tokens = accepted_buffer
         return metadata
 
 
