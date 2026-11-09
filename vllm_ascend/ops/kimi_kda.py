@@ -34,7 +34,7 @@ from vllm.models.kimi_k3.nvidia.kda import (
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 from vllm_ascend.ascend_config import validate_additional_config_bool
 from vllm_ascend.attention.utils import (
@@ -493,6 +493,16 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             else torch.ones(batch, dtype=torch.int32, device=state_indices.device)
         )
         replay_u, replay_k, replay_decay = self.kv_cache[2:5]
+        # A request whose first Verify is this step has no record to fold: its
+        # checkpoint was just written by prefill (or by the P/D transfer), and
+        # the page may still carry the previous occupant's records. Graph
+        # padding rows must never touch the shared null page either. Collapsing
+        # those rows to a zero accepted count makes the commit a no-op without
+        # touching the shared accept buffer the conv/recurrent kernels read.
+        first = getattr(metadata, "mega_first_verify", None)
+        if metadata.num_spec_decodes and first is not None and first.numel() >= batch:
+            skip = (first[:batch] > 0) | (state_indices <= NULL_BLOCK_ID)
+            accepted = torch.where(skip, torch.zeros_like(accepted), accepted)
         # Connector/KV synchronization must precede Commit in align mode.
         wait_for_kv_layer_from_connector(self.prefix)
         run_commit_recurrent_kda(
