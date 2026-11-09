@@ -487,10 +487,17 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         batch = int(state_indices.shape[0])
         if batch <= 0 or len(self.kv_cache) != 5:
             return None
+        # A FULL graph stages ``batch`` request rows and leaves the padding as
+        # NULL_BLOCK_ID, while the commit operator requires distinct slots.
+        # Hand it the live requests only: graph capture sees ``live == batch``
+        # and keeps one captured launch, eager/breakable replays size the
+        # launch per step.
+        live = metadata.num_spec_decodes if metadata.num_spec_decodes else batch
+        state_indices = state_indices[:live]
         accepted = (
-            metadata.num_accepted_tokens[:batch].to(torch.int32)
+            metadata.num_accepted_tokens[:live].to(torch.int32)
             if metadata.num_spec_decodes and metadata.num_accepted_tokens is not None
-            else torch.ones(batch, dtype=torch.int32, device=state_indices.device)
+            else torch.ones(live, dtype=torch.int32, device=state_indices.device)
         )
         replay_u, replay_k, replay_decay = self.kv_cache[2:5]
         # A request whose first Verify is this step has no record to fold: its
@@ -500,8 +507,8 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         # those rows to a zero accepted count makes the commit a no-op without
         # touching the shared accept buffer the conv/recurrent kernels read.
         first = getattr(metadata, "mega_first_verify", None)
-        if metadata.num_spec_decodes and first is not None and first.numel() >= batch:
-            skip = (first[:batch] > 0) | (state_indices <= NULL_BLOCK_ID)
+        if metadata.num_spec_decodes and first is not None and first.numel() >= live:
+            skip = (first[:live] > 0) | (state_indices <= NULL_BLOCK_ID)
             accepted = torch.where(skip, torch.zeros_like(accepted), accepted)
         # Connector/KV synchronization must precede Commit in align mode.
         wait_for_kv_layer_from_connector(self.prefix)
@@ -515,7 +522,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             operator=self._commit_operator,
         )
         return _MegaKDAReplayPlan(
-            batch=batch,
+            batch=live,
             state_indices=state_indices,
             accepted_tokens=accepted,
             replay_u=replay_u,
