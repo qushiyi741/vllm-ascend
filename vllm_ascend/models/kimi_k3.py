@@ -800,13 +800,16 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
         if self.is_block_write_layer:
             prefix_sum = None
 
-        if self.use_sequence_parallel:
-            hidden_states = sp_all_gather(hidden_states)
-            hidden_states = hidden_states[: positions.shape[0]]
-        hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            positions=positions,
-        )
+        if self.use_sequence_parallel and getattr(self.self_attn, "overlap_mega_kda_commit", False):
+            hidden_states = self.self_attn.forward_with_all_gather(hidden_states, positions)
+        else:
+            if self.use_sequence_parallel:
+                hidden_states = sp_all_gather(hidden_states)
+                hidden_states = hidden_states[: positions.shape[0]]
+            hidden_states = self.self_attn(
+                hidden_states=hidden_states,
+                positions=positions,
+            )
         if self.use_sequence_parallel and not self.fuse_o_proj_mm_reduce_scatter:
             hidden_states = sp_reduce_scatter(hidden_states)
 

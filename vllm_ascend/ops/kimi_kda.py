@@ -9,6 +9,7 @@ replaced here with the Ascend metadata builder and AscendC operators.
 
 from dataclasses import dataclass
 from functools import wraps
+from typing import Any
 
 import torch
 import torch_npu
@@ -28,6 +29,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.utils import replace_parameter
+from vllm.models.common.ops.sequence_parallel import sp_all_gather
 from vllm.models.kimi_k3.nvidia.kda import (
     KimiK3DeltaAttention,
 )
@@ -36,7 +38,7 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
-from vllm_ascend.ascend_config import validate_additional_config_bool
+from vllm_ascend.ascend_config import get_ascend_config, validate_additional_config_bool
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,
@@ -64,7 +66,7 @@ from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import (
     AscendW8A8MXFP8DynamicLinearMethod,
 )
-from vllm_ascend.utils import npu_stream_switch
+from vllm_ascend.utils import npu_stream_switch, shared_experts_calculation_stream
 
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
 _F_PROJ_SHARD_ID = 1
@@ -231,6 +233,7 @@ class _MegaKDAReplayPlan:
     replay_u: torch.Tensor
     replay_k: torch.Tensor
     replay_decay: torch.Tensor
+    commit_done: Any | None = None
 
 
 def _kimi_kda_with_output(
@@ -252,19 +255,39 @@ def _kimi_kda_with_output_fake(
     return
 
 
-def _kimi_kda(hidden_states: torch.Tensor, positions: torch.Tensor, layer_name: str, output_rows: int) -> torch.Tensor:
-    # The ordinary FULL/eager path can return the external operator's fresh
-    # result directly. Only breakable segments need a caller-owned buffer.
+def _kimi_kda(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    output_rows: int,
+    gather_input: bool = False,
+) -> torch.Tensor:
+    # Keep planning, events and metadata inside the existing opaque boundary.
     layer = get_forward_context().no_compile_layers[layer_name]
-    plan = layer._plan_mega_kda(hidden_states)
+    if gather_input:
+        # Validate the post-gather, post-trim shape before committing anything,
+        # including on fallback. The planner does not read hidden-state data.
+        plan = layer._plan_mega_kda(hidden_states, num_tokens=positions.shape[0])
+    else:
+        plan = layer._plan_mega_kda(hidden_states)
+    replay_plan = None
+    if plan is not None:
+        replay_plan = layer._prepare_mega_replayssm(commit_async=gather_input)
+    if gather_input:
+        hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
+        if replay_plan is not None and replay_plan.commit_done is not None:
+            torch.npu.current_stream().wait_event(replay_plan.commit_done)
     if plan is None:
         return layer._forward_default(hidden_states, positions)
-    replay_plan = layer._prepare_mega_replayssm()
     return layer._execute_mega_kda(hidden_states, positions, plan, replay_plan)
 
 
 def _kimi_kda_fake(
-    hidden_states: torch.Tensor, positions: torch.Tensor, layer_name: str, output_rows: int
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    output_rows: int,
+    gather_input: bool = False,
 ) -> torch.Tensor:
     return hidden_states.new_empty((output_rows, hidden_states.shape[-1]))
 
@@ -339,6 +362,9 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             load_mega_kda_operator(replayssm=self.use_mega_kda_replayssm) if self.use_mega_kda else None
         )
         self._commit_operator = load_commit_recurrent_kda_operator() if self.use_mega_kda_replayssm else None
+        self.overlap_mega_kda_commit = (
+            self.use_mega_kda_replayssm and get_ascend_config().multistream_overlap_shared_expert
+        )
         quant_config = getattr(vllm_config, "quant_config", None)
         uses_mixed_projection = bool(
             quant_config is not None
@@ -460,13 +486,23 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 return output
         return self._forward_default(hidden_states, positions)
 
+    def forward_with_all_gather(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Overlap ReplaySSM Commit with the Kimi SP input collective."""
+        if is_breakable_cudagraph_enabled():
+            # Preserve the existing breakable-segment output/buffer contract.
+            return self.forward(sp_all_gather(hidden_states)[: positions.shape[0]], positions)
+        rows = positions.shape[0]
+        if type(getattr(self.o_proj, "custom_op", None)) is KimiOProjMMReduceScatterOp:
+            rows = (rows + self.tp_size - 1) // self.tp_size
+        return torch.ops.vllm.ascend_kimi_kda(hidden_states, positions, self.prefix, rows, True)
+
     def _allocate_mega_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
         rows = hidden_states.shape[0]
         if type(getattr(self.o_proj, "custom_op", None)) is KimiOProjMMReduceScatterOp:
             rows = (rows + self.tp_size - 1) // self.tp_size
         return hidden_states.new_empty((rows, self.hidden_size))
 
-    def _prepare_mega_replayssm(self) -> _MegaKDAReplayPlan | None:
+    def _prepare_mega_replayssm(self, *, commit_async: bool = False) -> _MegaKDAReplayPlan | None:
         """Prepare and commit the previous replay record for this layer."""
         if not getattr(self, "use_mega_kda_replayssm", False):
             return None
@@ -528,15 +564,24 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         replay_u, replay_k, replay_decay = self.kv_cache[2:5]
         # Connector/KV synchronization must precede Commit in align mode.
         wait_for_kv_layer_from_connector(self.prefix)
-        run_commit_recurrent_kda(
-            self.kv_cache[1],
-            replay_u,
-            replay_k,
-            replay_decay,
-            accepted,
-            state_indices,
-            operator=self._commit_operator,
-        )
+        # Publish metadata and any connector/align copies BEFORE AllGather.
+        # Only Commit moves to the auxiliary stream; all HCCL calls stay on
+        # their original stream, in the original order.
+        stream = shared_experts_calculation_stream() if commit_async else None
+        ready = torch.npu.current_stream().record_event() if commit_async else None
+        with npu_stream_switch(stream, enabled=commit_async):
+            if ready is not None:
+                stream.wait_event(ready)
+            run_commit_recurrent_kda(
+                self.kv_cache[1],
+                replay_u,
+                replay_k,
+                replay_decay,
+                accepted,
+                state_indices,
+                operator=self._commit_operator,
+            )
+            commit_done = stream.record_event() if commit_async else None
         return _MegaKDAReplayPlan(
             batch=live,
             state_indices=state_indices,
@@ -545,6 +590,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             replay_u=replay_u,
             replay_k=replay_k,
             replay_decay=replay_decay,
+            commit_done=commit_done,
         )
 
     def _forward_default(
@@ -572,7 +618,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             return self.o_proj(core_attn_out)[0]
         return super().forward(hidden_states, positions)
 
-    def _plan_mega_kda(self, hidden_states: torch.Tensor) -> _MegaKDAPlan | None:
+    def _plan_mega_kda(self, hidden_states: torch.Tensor, *, num_tokens: int | None = None) -> _MegaKDAPlan | None:
         """Resolve a supported decode/verify batch before touching state."""
         if self._mega_weights is None or hidden_states.dtype != torch.bfloat16:
             return None
@@ -611,11 +657,12 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         # FULL graphs use graph-sized stable state tables. Padding is a suffix
         # of NULL_BLOCK_ID rows, exactly as in the source PR's runtime B/S ABI.
         batch = query_start_loc.numel() - 1
-        if batch <= 0 or hidden_states.ndim != 2 or hidden_states.shape[0] % batch:
+        num_tokens = hidden_states.shape[0] if num_tokens is None else num_tokens
+        if batch <= 0 or hidden_states.ndim != 2 or num_tokens % batch:
             return None
         if batch % self.tp_size != 0 or batch > self.tp_size * _MEGA_KDA_MAX_BATCH_MULTIPLIER:
             return None
-        spec_len = hidden_states.shape[0] // batch
+        spec_len = num_tokens // batch
         if spec_len != self.num_spec + 1:
             return None
         # V2 can schedule variable-length requests. An average S matching the
