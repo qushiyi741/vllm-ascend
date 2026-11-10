@@ -637,9 +637,15 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 return None
             conv_accepted = getattr(metadata, "mega_conv_accepted_tokens", None)
             if conv_accepted is None:
+                # Conv history uses the same one-based accepted-token count as
+                # the regular GDN speculative path.  In particular, the first
+                # Verify after prefill has no accepted draft prefix, but its
+                # neutral Conv count is still 1, so the history offset is 0.
+                # Do not substitute ``spec_len`` here: that points MegaKDA at
+                # the unused speculative tail of the wide Conv page.
                 conv_accepted = torch.where(
                     first_verify[:batch] > 0,
-                    torch.full_like(accepted, spec_len),
+                    torch.ones_like(accepted),
                     accepted,
                 )
             elif conv_accepted.numel() < batch:

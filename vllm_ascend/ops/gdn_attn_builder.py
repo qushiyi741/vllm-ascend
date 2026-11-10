@@ -1135,13 +1135,20 @@ class AscendMegaKDAHostMetadataBuilder(AscendGDNHostMetadataBuilder):
             metadata.mega_first_verify = first_buffer
             # One preparation per metadata group/step, shared by every KDA
             # layer. Keep the output address stable across FULL replays.
+            #
+            # ``num_accepted_tokens`` is one-based for the normal Mamba/GDN
+            # contract: 1 is the neutral value for an ordinary decode and is
+            # also the correct value for the first Verify after a prefill.
+            # The prefilling Conv path stores its three-token history at the
+            # beginning of the wide Conv page.  MegaKDA uses
+            # ``conv_num_accepted_tokens - 1`` as the history offset, so a
+            # first Verify must read from offset 0 (count 1).  The previous
+            # ReplaySSM integration replaced first Verify rows with
+            # ``num_spec + 1`` here, which made MegaKDA read the unused draft
+            # tail of the page and corrupted the first decode output.
             conv_accepted = self._mega_conv_accepted[:graph_batch]
-            torch.where(
-                first_buffer > 0,
-                torch.full_like(conv_accepted, self.num_spec + 1),
-                metadata.num_accepted_tokens[:graph_batch].to(torch.int32),
-                out=conv_accepted,
-            )
+            accepted = metadata.num_accepted_tokens[:graph_batch].to(torch.int32)
+            torch.where(first_buffer > 0, torch.ones_like(accepted), accepted, out=conv_accepted)
             metadata.mega_conv_accepted_tokens = conv_accepted
         return metadata
 
