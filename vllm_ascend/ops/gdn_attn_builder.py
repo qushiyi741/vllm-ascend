@@ -1097,6 +1097,10 @@ class AscendMegaKDAHostMetadataBuilder(AscendGDNHostMetadataBuilder):
         # be established safely. Keep the existing KDA implementation.
         metadata.mega_first_verify = None
         metadata.mega_conv_accepted_tokens = None
+        # Replay inputs are prepared lazily by the first KDA layer at runtime.
+        # Reset the per-step marker here because FULL-graph runners may reuse
+        # metadata storage while staging a new request batch.
+        metadata._mega_replay_inputs = None
         metadata.mega_has_folded_prefills = True
         metadata.mega_query_lens = ()
         if is_prefilling is None or (mega_first_verify is None and not self._ensure_mega_tracker()):

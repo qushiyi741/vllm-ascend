@@ -223,6 +223,10 @@ class _MegaKDAPlan:
 class _MegaKDAReplayPlan:
     batch: int
     state_indices: torch.Tensor
+    # Full graph-sized, contiguous state indices used by MegaKDA.  The commit
+    # launch only uses ``state_indices`` (the live prefix), while MegaKDA must
+    # retain graph padding rows so its batch shape stays unchanged.
+    mega_state_indices: torch.Tensor
     accepted_tokens: torch.Tensor
     replay_u: torch.Tensor
     replay_k: torch.Tensor
@@ -493,23 +497,35 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         # and keeps one captured launch, eager/breakable replays size the
         # launch per step.
         live = metadata.num_spec_decodes if metadata.num_spec_decodes else batch
-        state_indices = state_indices[:live]
-        accepted = (
-            metadata.num_accepted_tokens[:live].to(torch.int32)
-            if metadata.num_spec_decodes and metadata.num_accepted_tokens is not None
-            else torch.ones(live, dtype=torch.int32, device=state_indices.device)
-        )
+
+        # Every KDA layer sees the same request metadata, but owns different
+        # checkpoint/replay pages.  Prepare the request-level inputs lazily on
+        # the first layer and reuse them for the remaining layers.  Keeping
+        # this in the runtime path is deliberate: metadata construction can
+        # precede connector/page migration and FULL-graph replay by an
+        # arbitrary amount of time.
+        cached = getattr(metadata, "_mega_replay_inputs", None)
+        if cached is None or cached[0] != batch or cached[1] != live:
+            full_state_indices = state_indices.to(torch.int32).contiguous()
+            commit_state_indices = full_state_indices[:live]
+            accepted = (
+                metadata.num_accepted_tokens[:live].to(torch.int32).contiguous()
+                if metadata.num_spec_decodes and metadata.num_accepted_tokens is not None
+                else torch.ones(live, dtype=torch.int32, device=full_state_indices.device)
+            )
+            # A request whose first Verify is this step has no record to fold:
+            # its checkpoint was just written by prefill (or by P/D transfer),
+            # and the page may still carry the previous occupant's records.
+            # Padding rows must not touch the shared null page either. Make
+            # those rows a commit no-op without changing MegaKDA's graph batch.
+            first = getattr(metadata, "mega_first_verify", None)
+            if metadata.num_spec_decodes and first is not None and first.numel() >= live:
+                skip = (first[:live] > 0) | (commit_state_indices <= NULL_BLOCK_ID)
+                accepted = torch.where(skip, torch.zeros_like(accepted), accepted)
+            cached = (batch, live, full_state_indices, commit_state_indices, accepted)
+            metadata._mega_replay_inputs = cached
+        _, _, full_state_indices, state_indices, accepted = cached
         replay_u, replay_k, replay_decay = self.kv_cache[2:5]
-        # A request whose first Verify is this step has no record to fold: its
-        # checkpoint was just written by prefill (or by the P/D transfer), and
-        # the page may still carry the previous occupant's records. Graph
-        # padding rows must never touch the shared null page either. Collapsing
-        # those rows to a zero accepted count makes the commit a no-op without
-        # touching the shared accept buffer the conv/recurrent kernels read.
-        first = getattr(metadata, "mega_first_verify", None)
-        if metadata.num_spec_decodes and first is not None and first.numel() >= live:
-            skip = (first[:live] > 0) | (state_indices <= NULL_BLOCK_ID)
-            accepted = torch.where(skip, torch.zeros_like(accepted), accepted)
         # Connector/KV synchronization must precede Commit in align mode.
         wait_for_kv_layer_from_connector(self.prefix)
         run_commit_recurrent_kda(
@@ -524,6 +540,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         return _MegaKDAReplayPlan(
             batch=live,
             state_indices=state_indices,
+            mega_state_indices=full_state_indices,
             accepted_tokens=accepted,
             replay_u=replay_u,
             replay_k=replay_k,
@@ -879,7 +896,13 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             wait_for_kv_layer_from_connector(self.prefix)
         record_attention_compute_start()
         paged_batch = None
-        conv_indices = plan.conv_state_block_ids
+        # ReplaySSM preparation materializes the graph-sized state-index view
+        # once per forward step. Reusing it here avoids another per-layer
+        # contiguous conversion in ``run_mega_recurrent_kda`` while preserving
+        # the full graph batch (the commit plan only contains live rows).
+        conv_indices = (
+            replay_plan.mega_state_indices if replay_plan is not None else plan.conv_state_block_ids
+        )
         recurrent_indices = plan.ssm_state_indices
         if replay_plan is None and not (conv_state.is_contiguous() and recurrent_state.is_contiguous()):
             paged_batch = self._mega_cache_adapter.gather(
