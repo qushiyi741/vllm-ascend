@@ -610,11 +610,9 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         batch = int(state_indices.shape[0])
         if batch <= 0 or len(self.kv_cache) != 5:
             return None
-        # A FULL graph stages ``batch`` request rows and leaves the padding as
-        # NULL_BLOCK_ID, while the commit operator requires distinct slots.
-        # Hand it the live requests only: graph capture sees ``live == batch``
-        # and keeps one captured launch, eager/breakable replays size the
-        # launch per step.
+        # A FULL graph stages ``batch`` request rows and leaves padding rows at
+        # NULL_BLOCK_ID. The Commit operator accepts repeated state indices;
+        # keep those null rows intact and make only live request rows active.
         live = metadata.num_spec_decodes if metadata.num_spec_decodes else batch
 
         # Every KDA layer sees the same request metadata, but owns different

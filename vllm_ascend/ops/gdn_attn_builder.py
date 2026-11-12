@@ -1034,23 +1034,11 @@ class AscendMegaKDAHostMetadataBuilder(AscendGDNHostMetadataBuilder):
             kwargs.setdefault("num_accepted_tokens", torch.ones(num_reqs, dtype=torch.int32, device=device))
             kwargs.setdefault("num_decode_draft_tokens_cpu", torch.full((num_reqs,), self.num_spec, dtype=torch.int32))
             kwargs.setdefault("mega_first_verify", torch.zeros(num_reqs, dtype=torch.int32, device=device))
-        metadata = self.build(
+        return self.build(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
             **kwargs,
         )
-        table = getattr(metadata, "spec_state_indices_tensor", None)
-        if table is not None and table.ndim == 2 and table.shape[0] > 0:
-            # Capture runs the real verify/commit kernels on a dummy batch. The
-            # dummy block table hands every row the null id, while the external
-            # commit operator rejects duplicate slots, so seed the staged table
-            # with distinct placeholders. This runs before the graph context is
-            # entered, and every replay re-stages the buffer from the scheduler
-            # block table, so the placeholders never reach a real step.
-            table[:, 0].copy_(
-                torch.arange(1, table.shape[0] + 1, dtype=table.dtype, device=table.device)
-            )
-        return metadata
 
     def _ensure_mega_tracker(self):
         # MambaSpec describes page shapes, not capacity. Read the actual bound
