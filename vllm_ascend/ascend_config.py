@@ -448,6 +448,7 @@ class AscendConfig:
             "draft_window_size": null,
             "mix_placement": false,
             "enable_mega_kda_replayssm": false,
+            "enable_mega_kda_commit_overlap": true,
             "pa_shape_list": [],
             "mega_moe_max_tokens": 65536,
             "ascend_log_path": "~/ascend/log/vllm_ascend",
@@ -600,6 +601,12 @@ class AscendConfig:
     # This is an Ascend-specific switch and is intentionally independent of
     # vLLM's generic cache_config.use_replayssm setting.
     enable_mega_kda_replayssm: bool = False
+    # Overlap the ReplaySSM commit operator with the Kimi SP input AllGather on
+    # a dedicated stream (default, preserves existing behavior). Setting this
+    # to false restores sequential execution: the AllGather completes first and
+    # commit runs on the main stream before MegaKDA. Only effective when
+    # enable_mega_kda_replayssm is true.
+    enable_mega_kda_commit_overlap: bool = True
     # When non-zero, force the MC2 combine stage's comm quant_mode to this
     # value (e.g. 4 = MXFP float8_e4m3 communication quantization) regardless of the
     # model's quant_type, 0 means disabled (use the model's own quant).

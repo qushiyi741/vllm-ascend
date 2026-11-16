@@ -154,13 +154,13 @@ def _kda_bfg_stream() -> torch.npu.Stream:
 def _mega_kda_commit_stream() -> torch.npu.Stream:
     """Dedicated ReplaySSM commit stream, independent of the shared-expert stream.
 
-    The commit overlap is owned by enable_mega_kda_replayssm alone, so it must
-    not share a queue with the MoE shared-expert multistream: attention-phase
-    commit work and MLP-phase shared-expert work would otherwise serialize on
-    one stream and break both features' intended overlap windows. A dedicated
-    stream also keeps the commit operator's AIC quota selection (resolved from
-    the current stream) decoupled from any limits set on the shared-expert
-    stream.
+    The commit overlap is owned by enable_mega_kda_replayssm (plus its
+    enable_mega_kda_commit_overlap opt-out) alone, so it must not share a
+    queue with the MoE shared-expert multistream: attention-phase commit work
+    and MLP-phase shared-expert work would otherwise serialize on one stream
+    and break both features' intended overlap windows. A dedicated stream also
+    keeps the commit operator's AIC quota selection (resolved from the current
+    stream) decoupled from any limits set on the shared-expert stream.
     """
     global _MEGA_KDA_COMMIT_STREAM
     if _MEGA_KDA_COMMIT_STREAM is None:
@@ -447,7 +447,13 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         # Commit multistream is owned by ReplaySSM alone and deliberately
         # independent of multistream_overlap_shared_expert: the MoE switch
         # keeps its own stream, and commit runs on _mega_kda_commit_stream().
-        self.overlap_mega_kda_commit = self.use_mega_kda_replayssm
+        # additional_config.enable_mega_kda_commit_overlap=false restores the
+        # sequential layout: the SP AllGather completes first and commit runs
+        # on the main stream before MegaKDA.
+        self.overlap_mega_kda_commit = self.use_mega_kda_replayssm and validate_additional_config_bool(
+            (getattr(vllm_config, "additional_config", None) or {}).get("enable_mega_kda_commit_overlap", True),
+            "additional_config.enable_mega_kda_commit_overlap",
+        )
         # PD decode workers receive both KV and KDA state through the
         # connector, so their default (prefill/recompute) KDA path is dead in
         # steady state; the ND projections can be released after the NZ
