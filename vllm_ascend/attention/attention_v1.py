@@ -204,6 +204,10 @@ class AscendMetadata:
     # never run again after capture.
     query_start_loc_gpu: torch.Tensor = None
     seq_lens_gpu: torch.Tensor = None
+    # Set by backends whose attention op consumes the device-side length
+    # buffers directly (FIA v2). The host fields above then only mirror a
+    # non-blocking upper bound for Python shape/padding work.
+    use_device_seq_lens: bool = False
 
     # ********************** KV Cache Related Properties ********************* #
     # Block addresses per sequence (Seq id -> list of physical block).
@@ -405,13 +409,29 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_decodes=num_decodes,
             num_prefills=num_prefills,
         )
+        use_device_seq_lens = getattr(common_attn_metadata, "use_device_seq_lens", False)
+        seq_lens_gpu = common_attn_metadata.seq_lens
+        # FULL replays pad the request batch while the query boundary can
+        # carry one extra padding request. FIA v2 requires one KV length per
+        # query sequence, so grow the device buffer to that count exactly
+        # like the host mirror below. The slice keeps addressing the
+        # persistent model-runner buffer that is refreshed in place.
+        if (
+            use_device_seq_lens
+            and seq_lens_gpu is not None
+            and seq_lens_gpu.shape[0] < num_reqs_fia
+        ):
+            seq_lens_gpu = torch.cat(
+                [seq_lens_gpu, seq_lens_gpu.new_ones(num_reqs_fia - seq_lens_gpu.shape[0])]
+            )
         attn_metadata = self.metadata_cls(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
             block_tables=block_table,
             query_start_loc=query_start_loc,
             query_start_loc_gpu=common_attn_metadata.query_start_loc,
-            seq_lens_gpu=common_attn_metadata.seq_lens,
+            seq_lens_gpu=seq_lens_gpu,
+            use_device_seq_lens=use_device_seq_lens,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
             seq_lens_list=seq_lens_list,
@@ -724,6 +744,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ) -> torch.Tensor:
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
+        if (
+            attn_metadata.use_device_seq_lens
+            and attn_metadata.query_start_loc_gpu is not None
+            and attn_metadata.seq_lens_gpu is not None
+        ):
+            return self._full_graph_fia_v2_device_lengths(
+                query, key, value, attn_metadata, output, block_size, block_table
+            )
         actual_seq_lengths_kv = attn_metadata.seq_lens
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
@@ -781,6 +809,126 @@ class AscendAttentionBackendImpl(AttentionImpl):
             FIAV2ParamProvider(self._layer_name),
         )
         return output, num_tokens
+
+    def _full_graph_fia_v2_device_lengths(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        block_size: int,
+        block_table: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, int]:
+        """Capture draft attention whose every FIA v2 operand is device-resident.
+
+        The length sources address the model runner's persistent
+        query_start_loc/seq_lens buffers, refreshed in place by the
+        input-preparation kernels before every replay, and block_table /
+        atten_mask / workspace are stable capture resources. Nothing on the
+        host changes between replays, so the op is captured as a plain graph
+        operation: no ``register_task`` entry means no per-replay Python-side
+        re-dispatch of FIA inside ``UpdatableGraph.update``.
+        """
+        num_reqs = len(attn_metadata.actual_seq_lengths_q)
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1] if num_reqs else 0
+        query = query[:num_tokens]
+        softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
+        output_view = output[: attn_metadata.num_actual_tokens]
+        if block_table is None:
+            key = key.contiguous()
+            value = value.contiguous()
+        actual_seq_qlen = attn_metadata.query_start_loc_gpu[1 : num_reqs + 1]
+        actual_seq_kvlen = attn_metadata.seq_lens_gpu[:num_reqs]
+        sparse_mode = 4 if self.sliding_window is not None else 3
+        pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
+        workspace = get_capture_resource(
+            _FIA_V2_WORKSPACE_KEY,
+            lambda: torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
+                query=query,
+                key=key,
+                value=value,
+                atten_mask=attn_metadata.attn_mask,
+                block_table=block_table,
+                input_layout="TND",
+                block_size=block_size,
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_kvlen=actual_seq_kvlen,
+                num_key_value_heads=self.num_kv_heads,
+                softmax_scale=self.scale,
+                num_query_heads=self.num_heads,
+                sparse_mode=sparse_mode,
+                pre_tokens=pre_tokens,
+                next_tokens=0,
+            ),
+            self._use_max_workspace_for_fia_graph,
+        )
+        torch_npu.npu_fused_infer_attention_score_v2.out(
+            query=query,
+            key=key,
+            value=value,
+            atten_mask=attn_metadata.attn_mask,
+            block_table=block_table,
+            input_layout="TND",
+            block_size=block_size,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_kvlen=actual_seq_kvlen,
+            num_key_value_heads=self.num_kv_heads,
+            num_query_heads=self.num_heads,
+            sparse_mode=sparse_mode,
+            pre_tokens=pre_tokens,
+            next_tokens=0,
+            softmax_scale=self.scale,
+            workspace=workspace,
+            out=[output_view, softmax_lse],
+        )
+        return output, num_tokens
+
+    def _forward_fia_v2_device_lengths(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        block_size: int,
+        block_table: torch.Tensor | None,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Eager draft attention with device-side sequence lengths.
+
+        The ordinary FIA v1 ABI takes ``actual_seq_lengths(_kv)`` as host
+        lists. The draft's exact window lengths live on NPU, so converting
+        them with ``tolist()`` inserts a host wait between target decode and
+        the draft. FIA v2 consumes the persistent device length buffers
+        directly and keeps this transition asynchronous.
+        """
+        num_reqs = len(attn_metadata.actual_seq_lengths_q)
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1] if num_reqs else 0
+        query = query[:num_tokens]
+        actual_seq_qlen = attn_metadata.query_start_loc_gpu[1 : num_reqs + 1]
+        actual_seq_kvlen = attn_metadata.seq_lens_gpu[:num_reqs]
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+            query=query,
+            key=key,
+            value=value,
+            atten_mask=attn_metadata.attn_mask,
+            block_table=block_table,
+            input_layout="TND",
+            block_size=block_size,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_kvlen=actual_seq_kvlen,
+            num_key_value_heads=self.num_kv_heads,
+            num_query_heads=self.num_heads,
+            softmax_scale=self.scale,
+            sparse_mode=4 if self.sliding_window is not None else 3,
+            pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
+            next_tokens=0,
+        )
+        # FIA v2 returns a flattened TND result while the attention output
+        # buffer is [tokens, num_heads, head_size].
+        attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+        output[:num_tokens] = attn_output[:num_tokens]
+        return output
 
     def full_graph_pa(
         self,
@@ -885,7 +1033,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
         if _EXTRA_CTX.capturing:
-            if self.sinks is not None:
+            if self.sinks is not None or attn_metadata.use_device_seq_lens:
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
@@ -908,6 +1056,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if block_table is None:
             key = key.contiguous()
             value = value.contiguous()
+
+        # Draft backends with device-side lengths read the exact post-window
+        # KV state straight from the persistent buffers. Take this before the
+        # list-based branches: sourcing their host lists is what forces the
+        # device-to-host synchronization in the metadata build.
+        if (
+            attn_metadata.use_device_seq_lens
+            and self.sliding_window is not None
+            and attn_metadata.causal
+            and attn_metadata.attn_mask is not None
+            and not self.enable_c8_quant
+        ):
+            return self._forward_fia_v2_device_lengths(
+                query, key, value, attn_metadata, block_size, block_table, output
+            )
 
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:

@@ -355,6 +355,7 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
             self._context_slot_mappings = self._context_slot_mappings.to(torch.int32)  # type: ignore[has-type]
             # npu needs attn_backends to update full graph params in run_fullgraph.
             attn_backends: dict[str, type[AttentionBackend]] = {}
+            draft_impl_c8_quant = False
             active_layer_names = self.draft_attn_layer_names
             for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
                 layer_names = kv_cache_group_spec.layer_names
@@ -368,6 +369,7 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
 
                 for layer_name in layer_names:
                     attn_backends[layer_name] = attn_layers[layer_name].get_attn_backend()
+                    draft_impl_c8_quant |= getattr(attn_layers[layer_name].impl, "enable_c8_quant", False)
 
             self.attn_backends = attn_backends
             backend = _get_graph_update_backend(self.attn_groups)
@@ -379,6 +381,17 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
                 self.attn_architecture = None
             # Read each draft MLA layer's final backend selection.
             self._draft_mla_uses_device_lengths = self.attn_architecture == "MLA" and all_mla_use_flashmla(self.model)
+            # Window-GQA drafts own their exact KV lengths only on NPU. Route
+            # their attention through FIA v2 with device-side lengths so the
+            # per-step metadata build never waits on a tolist() of the NPU
+            # tensor, and the captured draft graph needs no host-side task
+            # rebinding. C8-quantized layers keep the list-based FIA v1 ABI,
+            # whose host mirror must stay exact.
+            self._use_device_seq_lens_draft = (
+                self._window_gqa_dcp_fallback
+                and self.attn_architecture == "GQA"
+                and not draft_impl_c8_quant
+            )
             dflash_speculator.prepare_dflash_inputs = prepare_dflash_inputs_factory(
                 self.vllm_config.cache_config.block_size
             )
@@ -484,6 +497,7 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
                 seq_lens_cpu=seq_lens_cpu,
                 attn_state=AscendAttentionState.ChunkedPrefill,
                 parallel_config=self.attn_vllm_config.parallel_config,
+                use_device_seq_lens=getattr(self, "_use_device_seq_lens_draft", False),
             ),
         ):
             attn_metadata = super()._build_attn_metadata(

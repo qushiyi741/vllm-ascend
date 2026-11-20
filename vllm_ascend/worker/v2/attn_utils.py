@@ -490,8 +490,11 @@ def build_attn_metadata(
     copy_sfa_draft_index: int | None = None,
     copy_sfa_restore_tails: bool = False,
     draft_layer_names: set[str] | None = None,
+    use_device_seq_lens: bool | None = None,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
+    if use_device_seq_lens is None:
+        use_device_seq_lens = _DRAFT_CAPTURE_USE_DEVICE_SEQ_LENS.get()
     if skip_ring_state_update is None:
         skip_ring_state_update = ring_state_update_skipped()
     if seq_lens_np is None:
@@ -619,6 +622,7 @@ def build_attn_metadata(
             copy_sfa_restore_tails=copy_sfa_restore_tails,
             dcp_local_seq_lens=dcp_local_seq_lens,
             dcp_local_seq_lens_cpu=dcp_local_seq_lens_cpu,
+            use_device_seq_lens=use_device_seq_lens,
             **common_attn_metadata_extra_kwargs,
         )
 
@@ -2044,6 +2048,26 @@ def _reshape_kv_cache_v2(
 
 _BUILD_ATTN_METADATA_MODULE = _speculator
 
+# Draft graph capture builds attention metadata through the patched upstream
+# ``_prepare_dflash_inputs_to_capture`` helper, which offers no channel for
+# Ascend-specific keyword arguments. The draft graph manager sets this flag
+# around ``capture()`` so the capture-time build resolves the same
+# device-length mode that the runtime speculator passes explicitly through
+# ``build_attn_metadata_factory``.
+_DRAFT_CAPTURE_USE_DEVICE_SEQ_LENS: ContextVar[bool] = ContextVar(
+    "draft_capture_use_device_seq_lens", default=False
+)
+
+
+@contextmanager
+def draft_capture_use_device_seq_lens(enabled: bool):
+    """Scope a draft-graph capture whose attention runs on device lengths."""
+    token = _DRAFT_CAPTURE_USE_DEVICE_SEQ_LENS.set(enabled)
+    try:
+        yield
+    finally:
+        _DRAFT_CAPTURE_USE_DEVICE_SEQ_LENS.reset(token)
+
 
 @contextmanager
 def build_attn_metadata_wrapper():
@@ -2058,7 +2082,15 @@ def build_attn_metadata_wrapper():
 
 @contextmanager
 def build_attn_metadata_factory(
-    positions, pad, is_prefilling, seq_lens_cpu=None, *, attn_state=None, parallel_config=None, offload_kwargs=None
+    positions,
+    pad,
+    is_prefilling,
+    seq_lens_cpu=None,
+    *,
+    attn_state=None,
+    parallel_config=None,
+    offload_kwargs=None,
+    use_device_seq_lens=None,
 ):
     """Wrap build_attn_metadata with Ascend draft-model context.
 
@@ -2077,6 +2109,8 @@ def build_attn_metadata_factory(
         kwargs["parallel_config"] = parallel_config
         if seq_lens_cpu is not None:
             kwargs["seq_lens_np"] = seq_lens_cpu.numpy()
+        if use_device_seq_lens is not None:
+            kwargs["use_device_seq_lens"] = use_device_seq_lens
         if offload_kwargs is not None:
             kwargs.update(offload_kwargs)
         return raw(*args, **kwargs)

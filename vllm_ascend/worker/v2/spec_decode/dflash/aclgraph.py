@@ -25,6 +25,7 @@ from vllm_ascend.compilation.updatable_graph import (
 )
 from vllm_ascend.utils import use_updatable_graph
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
+from vllm_ascend.worker.v2.attn_utils import draft_capture_use_device_seq_lens
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -71,7 +72,16 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture ACL graphs for DFlash."""
-        with communicator_switch(), model_capture_wrapper(self.speculator, False):
+        # Capture-time metadata is built by the patched upstream
+        # ``_prepare_dflash_inputs_to_capture`` helper, so the device-length
+        # mode is published through the capture context rather than a kwarg.
+        with (
+            communicator_switch(),
+            draft_capture_use_device_seq_lens(
+                getattr(self.speculator, "_use_device_seq_lens_draft", False)
+            ),
+            model_capture_wrapper(self.speculator, False),
+        ):
             super().capture(
                 forward_fn,
                 input_buffers,
@@ -87,15 +97,27 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
         attn_backend = list(self.speculator.attn_backends.values())[0]
+        if use_updatable_graph(attn_backend):
+            graph = self.graphs[desc]
+            assert isinstance(graph, UpdatableGraph)
+            # The per-replay metadata rebuild only feeds host-side task
+            # resolution. Graphs whose attention ops read refreshed device
+            # buffers directly register no update tasks and can skip it.
+            draft_attn_metadatas = (
+                self.speculator.build_draft_attn_metadatas(
+                    desc.num_reqs,
+                    self.speculator.input_batch.seq_lens_cpu_upper_bound,
+                )
+                if graph.tasks
+                else None
+            )
+            return self._updatable_graph_replay(desc, draft_attn_metadatas)
         draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
             desc.num_reqs,
             self.speculator.input_batch.seq_lens_cpu_upper_bound,
         )
-        if use_updatable_graph(attn_backend):
-            return self._updatable_graph_replay(desc, draft_attn_metadatas)
-        else:
-            # This will be removed once the refactoring is fully complete.
-            return self._graph_replay(desc, attn_backend, num_tokens, draft_attn_metadatas)
+        # This will be removed once the refactoring is fully complete.
+        return self._graph_replay(desc, attn_backend, num_tokens, draft_attn_metadatas)
 
     def _graph_replay(self, desc, attn_backend, num_tokens, draft_attn_metadatas):
         self.update_stream.wait_stream(torch.npu.current_stream())
@@ -131,8 +153,13 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
     def _updatable_graph_replay(self, desc, draft_attn_metadatas):
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
-        resolved_tasks = graph.resolve_tasks(ContextSource(draft_attn_metadatas[0]))
+        resolved_tasks = (
+            graph.resolve_tasks(ContextSource(draft_attn_metadatas[0]))
+            if draft_attn_metadatas is not None
+            else ()
+        )
         self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super().run_fullgraph(desc)
-        graph.update(self.update_stream, resolved_tasks)
+        if resolved_tasks:
+            graph.update(self.update_stream, resolved_tasks)
         return ret
