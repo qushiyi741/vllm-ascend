@@ -456,6 +456,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
+    # Window-GQA DSpark uses the device value as the authoritative KV length.
+    # The host fields remain a non-blocking upper-bound mirror used for Python
+    # shape/list operations; ordinary GQA must not infer this from the model
+    # type because other speculative backends still require exact host lengths.
+    use_device_seq_lens: bool = False
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
@@ -503,6 +508,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             _num_computed_tokens_cpu=_slice_reqs(self._num_computed_tokens_cpu),
             dcp_local_seq_lens=_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=_slice_reqs(self.dcp_local_seq_lens_cpu),
+            use_device_seq_lens=self.use_device_seq_lens,
             is_prefilling=_slice_reqs(self.is_prefilling),
             encoder_seq_lens=_slice_reqs(self.encoder_seq_lens),
             encoder_seq_lens_cpu=_slice_reqs(self.encoder_seq_lens_cpu),
@@ -745,6 +751,7 @@ def _select_seq_lens(
     across draft iterations, so building from it skips the NPU->CPU sync at
     ``seq_lens.tolist()`` in the metadata build.
     """
+    use_device_seq_lens = getattr(common_attn_metadata, "use_device_seq_lens", False)
     # Prefer _seq_lens_cpu (always available, updated during draft
     # iterations) over seq_lens_cpu (None in async spec decode mode).
     model_config = vllm_config.model_config
@@ -753,11 +760,18 @@ def _select_seq_lens(
         seq_lens = common_attn_metadata._seq_lens_cpu[:num_reqs]
     elif common_attn_metadata.seq_lens_cpu is not None:
         seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
+    elif use_device_seq_lens and common_attn_metadata.seq_lens_cpu_upper_bound is not None:
+        seq_lens = common_attn_metadata.seq_lens_cpu_upper_bound[:num_reqs]
     else:
         seq_lens = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
 
     if isinstance(kv_cache_spec, CrossAttentionSpec):
         seq_lens = common_attn_metadata.seq_lens
+    if use_device_seq_lens:
+        # The device copy is consumed directly by FIA v2.  Returning the host
+        # mirror here is intentional: it lets metadata construction call
+        # ``tolist()`` without waiting for the just-enqueued SWA kernels.
+        return seq_lens
     if speculative_config is not None and speculative_config.parallel_drafting:
         # PARD / DFlash (and DSpark on other models) keep the NPU seq_lens;
         # only DSpark on the GLM5.2 family keeps the CPU mirror above.

@@ -204,6 +204,9 @@ class AscendMetadata:
     # never run again after capture.
     query_start_loc_gpu: torch.Tensor = None
     seq_lens_gpu: torch.Tensor = None
+    # Window-GQA DSpark can pass the exact device-side KV lengths to FIA v2.
+    # ``seq_lens_list`` is then only a host-side shape/padding mirror.
+    use_device_seq_lens: bool = False
 
     # ********************** KV Cache Related Properties ********************* #
     # Block addresses per sequence (Seq id -> list of physical block).
@@ -405,13 +408,25 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_decodes=num_decodes,
             num_prefills=num_prefills,
         )
+        use_device_seq_lens = getattr(common_attn_metadata, "use_device_seq_lens", False)
+        seq_lens_gpu = common_attn_metadata.seq_lens
+        # The query boundaries can include one graph-padding request.  Keep
+        # the device-side KV lengths aligned with that row just as the host
+        # FIA mirror above; otherwise FIA v2 sees fewer KV lengths than query
+        # sequences during a padded replay.
+        if use_device_seq_lens and seq_lens_gpu.shape[0] < num_reqs_fia:
+            seq_lens_gpu = torch.cat(
+                [seq_lens_gpu, seq_lens_gpu.new_ones(num_reqs_fia - seq_lens_gpu.shape[0])]
+            )
+
         attn_metadata = self.metadata_cls(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
             block_tables=block_table,
             query_start_loc=query_start_loc,
             query_start_loc_gpu=common_attn_metadata.query_start_loc,
-            seq_lens_gpu=common_attn_metadata.seq_lens,
+            seq_lens_gpu=seq_lens_gpu,
+            use_device_seq_lens=use_device_seq_lens,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
             seq_lens_list=seq_lens_list,
@@ -724,9 +739,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ) -> torch.Tensor:
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
-        actual_seq_lengths_kv = attn_metadata.seq_lens
+        actual_seq_lengths_kv = (
+            attn_metadata.seq_lens_gpu
+            if attn_metadata.use_device_seq_lens and attn_metadata.seq_lens_gpu is not None
+            else attn_metadata.seq_lens
+        )
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
+        if attn_metadata.use_device_seq_lens and attn_metadata.query_start_loc_gpu is not None:
+            actual_seq_lengths_q = attn_metadata.query_start_loc_gpu[1 : len(actual_seq_lengths_q) + 1]
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         output_view = output[: attn_metadata.num_actual_tokens]
         if block_table is None:
@@ -781,6 +802,68 @@ class AscendAttentionBackendImpl(AttentionImpl):
             FIAV2ParamProvider(self._layer_name),
         )
         return output, num_tokens
+
+    def _forward_fia_v2_device_lengths(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        block_size: int,
+        block_table: torch.Tensor | None,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run Window-GQA FIA with device-side sequence lengths.
+
+        The ordinary FIA v1 ABI takes ``actual_seq_lengths_kv`` as a Python
+        list.  Window-GQA computes the post-rejection window length on NPU, so
+        converting that tensor with ``tolist()`` inserts a host wait between
+        target decode and the draft.  FIA v2 accepts the persistent device
+        length buffers and keeps this transition asynchronous.
+        """
+        num_reqs = len(attn_metadata.actual_seq_lengths_q)
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1] if num_reqs else 0
+        query = query[:num_tokens]
+        query_start_loc = attn_metadata.query_start_loc_gpu
+        if query_start_loc is None:
+            actual_seq_qlen = torch.tensor(
+                attn_metadata.actual_seq_lengths_q,
+                dtype=torch.int32,
+                device=query.device,
+            )
+        else:
+            actual_seq_qlen = query_start_loc[1 : num_reqs + 1]
+        seq_lens_gpu = attn_metadata.seq_lens_gpu
+        if seq_lens_gpu is None:
+            # This is only a defensive fallback for hand-built metadata in
+            # downstream integrations; normal builders always provide it for
+            # ``use_device_seq_lens``.
+            seq_lens_gpu = attn_metadata.seq_lens
+        actual_seq_kvlen = seq_lens_gpu[:num_reqs]
+
+        attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+            query=query,
+            key=key,
+            value=value,
+            atten_mask=attn_metadata.attn_mask,
+            block_table=block_table,
+            input_layout="TND",
+            block_size=block_size,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_kvlen=actual_seq_kvlen,
+            num_key_value_heads=self.num_kv_heads,
+            num_query_heads=self.num_heads,
+            softmax_scale=self.scale,
+            sparse_mode=4 if self.sliding_window is not None else 3,
+            pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
+            next_tokens=0,
+        )
+        # Keep the same layout conversion as the legacy FIA path.  v2 returns
+        # a flattened TND result on some CANN releases, while the attention
+        # output buffer is [tokens, num_heads, head_size].
+        attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
+        output[:num_tokens] = attn_output[:num_tokens]
+        return output
 
     def full_graph_pa(
         self,
@@ -908,6 +991,26 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if block_table is None:
             key = key.contiguous()
             value = value.contiguous()
+
+        # Window-GQA DSpark metadata carries an exact NPU KV-length tensor.
+        # Use FIA v2 before entering the legacy list-based branches; otherwise
+        # ``seq_lens_list`` has already forced a device-to-host synchronization.
+        if (
+            attn_metadata.use_device_seq_lens
+            and self.sliding_window is not None
+            and attn_metadata.causal
+            and attn_metadata.attn_mask is not None
+            and not self.enable_c8_quant
+        ):
+            return self._forward_fia_v2_device_lengths(
+                query,
+                key,
+                value,
+                attn_metadata,
+                block_size,
+                block_table,
+                output,
+            )
 
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
