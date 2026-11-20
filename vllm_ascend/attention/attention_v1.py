@@ -842,6 +842,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
         actual_seq_kvlen = attn_metadata.seq_lens_gpu[:num_reqs]
         sparse_mode = 4 if self.sliding_window is not None else 3
         pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
+        # The workspace-size query reads its length arguments on the host
+        # (LocalScalarDense). Handing it the device buffers would copy them
+        # out and synchronize the copy stream, which ACL forbids during
+        # capture. Size it from the host mirror exactly like the FIA v1
+        # path does; real replay lengths never exceed that upper bound.
+        host_seq_qlen = attn_metadata.actual_seq_lengths_q
+        if attn_metadata.seq_lens_list is not None:
+            host_seq_kvlen = attn_metadata.seq_lens_list
+        else:
+            host_seq_kvlen = host_seq_qlen
         workspace = get_capture_resource(
             _FIA_V2_WORKSPACE_KEY,
             lambda: torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
@@ -852,8 +862,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 block_table=block_table,
                 input_layout="TND",
                 block_size=block_size,
-                actual_seq_qlen=actual_seq_qlen,
-                actual_seq_kvlen=actual_seq_kvlen,
+                actual_seq_qlen=host_seq_qlen,
+                actual_seq_kvlen=host_seq_kvlen,
                 num_key_value_heads=self.num_kv_heads,
                 softmax_scale=self.scale,
                 num_query_heads=self.num_heads,
