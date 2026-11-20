@@ -477,14 +477,22 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
                 num_tokens=num_tokens_padded,
                 num_reqs=num_reqs_padded,
             )
-            attn_metadata = self._build_uniform_attn_metadata(
-                num_reqs=self.input_batch.num_reqs,
-                batch_desc=batch_desc,
-                num_query_per_req=self.num_query_per_req,
-                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-                step=self.num_query_per_req,
-                causal=self._group_causal,
-            )
+            # This build feeds the replay-time task update, which runs only
+            # after the graph is enqueued. Mark it so the metadata build
+            # waits for the staged exact lengths instead of publishing the
+            # FULL-path upper bound.
+            self._await_staged_lengths = True
+            try:
+                attn_metadata = self._build_uniform_attn_metadata(
+                    num_reqs=self.input_batch.num_reqs,
+                    batch_desc=batch_desc,
+                    num_query_per_req=self.num_query_per_req,
+                    seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                    step=self.num_query_per_req,
+                    causal=self._group_causal,
+                )
+            finally:
+                self._await_staged_lengths = False
 
         return [attn_metadata]
 
@@ -522,13 +530,25 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
             and getattr(self, "_use_device_seq_lens_draft", False)
             and getattr(self, "_draft_seq_lens_pinned", None) is not None
         ):
-            # The early D2H enqueued behind the input-preparation kernel has
-            # long completed by this point, so this wait is effectively free.
-            # The factory publishes the pinned mirror as the seq_lens source
-            # so the metadata build reads exact host values instead of
-            # blocking on a tolist() of the NPU tensor.
-            self._draft_seq_lens_copy_event.synchronize()
-            seq_lens_cpu = self._draft_seq_lens_pinned
+            if (
+                batch_desc.cg_mode == CUDAGraphMode.FULL
+                and not getattr(self, "_await_staged_lengths", False)
+                and seq_lens_cpu_upper_bound is not None
+            ):
+                # FULL replays discard this build's values: the graph's FIA
+                # host lists come from the task-update build, which runs
+                # after the replay is enqueued. Publish the upper bound and
+                # stay synchronization-free -- waiting here would sleep the
+                # host before the draft graph is dispatched and let the
+                # device run dry mid-step.
+                seq_lens_cpu = seq_lens_cpu_upper_bound
+            else:
+                # Eager drafts consume these values directly, and the
+                # task-update build runs only after the graph replay is
+                # enqueued. In both positions the event wait cannot starve
+                # the device of already-dispatched work.
+                self._draft_seq_lens_copy_event.synchronize()
+                seq_lens_cpu = self._draft_seq_lens_pinned
         with (
             build_attn_metadata_wrapper(),
             build_attn_metadata_factory(

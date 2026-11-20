@@ -98,20 +98,7 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         num_tokens = desc.num_tokens
         attn_backend = list(self.speculator.attn_backends.values())[0]
         if use_updatable_graph(attn_backend):
-            graph = self.graphs[desc]
-            assert isinstance(graph, UpdatableGraph)
-            # The per-replay metadata rebuild only feeds host-side task
-            # resolution. Graphs whose attention ops read refreshed device
-            # buffers directly register no update tasks and can skip it.
-            draft_attn_metadatas = (
-                self.speculator.build_draft_attn_metadatas(
-                    desc.num_reqs,
-                    self.speculator.input_batch.seq_lens_cpu_upper_bound,
-                )
-                if graph.tasks
-                else None
-            )
-            return self._updatable_graph_replay(desc, draft_attn_metadatas)
+            return self._updatable_graph_replay(desc)
         draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
             desc.num_reqs,
             self.speculator.input_batch.seq_lens_cpu_upper_bound,
@@ -150,16 +137,24 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
             )
         return ret
 
-    def _updatable_graph_replay(self, desc, draft_attn_metadatas):
+    def _updatable_graph_replay(self, desc):
         graph = self.graphs[desc]
         assert isinstance(graph, UpdatableGraph)
-        resolved_tasks = (
-            graph.resolve_tasks(ContextSource(draft_attn_metadatas[0]))
-            if draft_attn_metadatas is not None
-            else ()
-        )
         self.update_stream.wait_stream(torch.npu.current_stream())
         ret = super().run_fullgraph(desc)
-        if resolved_tasks:
+        if graph.tasks:
+            # Build the task-update metadata only after the replay is
+            # enqueued. The rebuild waits on the staged draft lengths, and
+            # that wait must never run before the graph is dispatched: the
+            # host would sleep while the device drains the eager precompute
+            # and then idles waiting for the graph, reopening the gap the
+            # staging removed. Waiting here mirrors the target's deferred
+            # num-computed-tokens sync -- by the time the host blocks,
+            # every op it owns is already on the device.
+            draft_attn_metadatas = self.speculator.build_draft_attn_metadatas(
+                desc.num_reqs,
+                self.speculator.input_batch.seq_lens_cpu_upper_bound,
+            )
+            resolved_tasks = graph.resolve_tasks(ContextSource(draft_attn_metadatas[0]))
             graph.update(self.update_stream, resolved_tasks)
         return ret
