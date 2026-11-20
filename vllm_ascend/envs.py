@@ -93,6 +93,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Window-GQA DSpark draft: source the FIA host KV lengths from the pure
+    # host-side upper-bound arithmetic (num_computed mirror + scheduled +
+    # draft width, the same approximation the DCP MLA draft ships in
+    # dcp_utils.prepare_draft_dcp_metadata_inputs) instead of staging the
+    # exact device-computed lengths through the early pinned D2H.
+    # Default: 0 (exact staged lengths). Set to 1 to A/B the approximation:
+    # on steps with rejected draft tokens the draft attention then reads up
+    # to (1 + num_speculative_tokens) stale slots past its query block, so
+    # measure the acceptance rate before keeping this mode.
+    "VLLM_ASCEND_DRAFT_SEQ_LENS_HOST_BOUND": lambda: _strict_binary_env(
+        "VLLM_ASCEND_DRAFT_SEQ_LENS_HOST_BOUND"
+    ),
 }
 
 # end-env-vars-definition

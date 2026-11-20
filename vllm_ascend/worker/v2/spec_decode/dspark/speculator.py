@@ -34,6 +34,7 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import get_eagle3_aux_layers_from_config
 
+from vllm_ascend import envs
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.mla_v1 import AscendMLABackend, all_mla_use_flashmla
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
@@ -397,7 +398,17 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
                 and self.attn_architecture == "GQA"
                 and not draft_impl_c8_quant
             )
-            if self._use_device_seq_lens_draft:
+            # A/B mode: derive the host KV lengths purely from the
+            # upper-bound arithmetic (num_computed mirror + scheduled + draft
+            # width) like the DCP MLA draft does, skipping the staged exact
+            # values entirely. On steps with rejected tokens this overstates
+            # the length by the rejection count, so the draft reads a few
+            # stale slots past its query block; measure the acceptance rate
+            # before keeping this mode.
+            self._draft_seq_lens_host_bound = (
+                self._use_device_seq_lens_draft and envs.VLLM_ASCEND_DRAFT_SEQ_LENS_HOST_BOUND
+            )
+            if self._use_device_seq_lens_draft and not self._draft_seq_lens_host_bound:
                 self._draft_seq_lens_pinned = torch.empty_like(
                     self.input_buffers.seq_lens, device="cpu", pin_memory=True
                 )
