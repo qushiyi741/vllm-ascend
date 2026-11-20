@@ -54,7 +54,10 @@ from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_wrapper,
 )
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
-from vllm_ascend.worker.v2.spec_decode.dflash.speculator import prepare_dflash_inputs_factory
+from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
+    prepare_dflash_inputs,
+    prepare_dflash_inputs_factory,
+)
 from vllm_ascend.worker.v2.spec_decode.lmhead_tp_utils import LmheadTPDraftSamplingMixin
 from vllm_ascend.worker.v2.spec_decode.pcp_utils import (
     disable_profiling_chunk_for_draft,
@@ -381,20 +384,46 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
                 self.attn_architecture = None
             # Read each draft MLA layer's final backend selection.
             self._draft_mla_uses_device_lengths = self.attn_architecture == "MLA" and all_mla_use_flashmla(self.model)
-            # Window-GQA drafts own their exact KV lengths only on NPU. Route
-            # their attention through FIA v2 with device-side lengths so the
-            # per-step metadata build never waits on a tolist() of the NPU
-            # tensor, and the captured draft graph needs no host-side task
-            # rebinding. C8-quantized layers keep the list-based FIA v1 ABI,
-            # whose host mirror must stay exact.
+            # Window-GQA drafts own their exact KV lengths only on NPU
+            # (rejection-corrected positions). FIA's ABI consumes host lists,
+            # so stage those lengths with an early non-blocking D2H enqueued
+            # right behind the input-preparation kernel: the copy completes
+            # while precompute still runs, so the later host wait is free and
+            # replaces the blocking tolist() of the NPU tensor inside the
+            # metadata build. C8-quantized layers keep the plain factory;
+            # their FIA ABI must not share the staged mirror.
             self._use_device_seq_lens_draft = (
                 self._window_gqa_dcp_fallback
                 and self.attn_architecture == "GQA"
                 and not draft_impl_c8_quant
             )
-            dflash_speculator.prepare_dflash_inputs = prepare_dflash_inputs_factory(
-                self.vllm_config.cache_config.block_size
-            )
+            if self._use_device_seq_lens_draft:
+                self._draft_seq_lens_pinned = torch.empty_like(
+                    self.input_buffers.seq_lens, device="cpu", pin_memory=True
+                )
+                self._draft_seq_lens_copy_event = torch.npu.Event()
+                dflash_speculator.prepare_dflash_inputs = self._prepare_dflash_inputs_with_length_stage
+            else:
+                self._draft_seq_lens_pinned = None
+                self._draft_seq_lens_copy_event = None
+                dflash_speculator.prepare_dflash_inputs = prepare_dflash_inputs_factory(
+                    self.vllm_config.cache_config.block_size
+                )
+
+    def _prepare_dflash_inputs_with_length_stage(self, *args: Any, **kwargs: Any) -> None:
+        """Run the input-preparation kernel, then stage its lengths to host.
+
+        The preparation kernel is the only producer of the draft's exact
+        (rejection-corrected) KV lengths on NPU. Enqueue the D2H directly
+        behind it so the pinned mirror is ready long before any host
+        consumer runs: the copy sits at the front of the device queue, so
+        waiting on its event later is effectively free.
+        """
+        prepare_dflash_inputs(
+            *args, **kwargs, kv_cache_block_size=self.vllm_config.cache_config.block_size
+        )
+        self._draft_seq_lens_pinned.copy_(self.input_buffers.seq_lens, non_blocking=True)
+        self._draft_seq_lens_copy_event.record()
 
     def _prepare_draft_dcp_metadata_inputs(
         self, num_reqs: int, num_reqs_padded: int, step: int
@@ -488,6 +517,18 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         # attention only consumes the tokens owned by real requests there.
         num_tokens = batch_desc.num_tokens if batch_desc.cg_mode == CUDAGraphMode.FULL else int(query_start_loc_np[-1])
         seq_lens_cpu, is_prefilling = self._prepare_draft_dcp_metadata_inputs(num_reqs, num_reqs_padded, step)
+        if (
+            seq_lens_cpu is None
+            and getattr(self, "_use_device_seq_lens_draft", False)
+            and getattr(self, "_draft_seq_lens_pinned", None) is not None
+        ):
+            # The early D2H enqueued behind the input-preparation kernel has
+            # long completed by this point, so this wait is effectively free.
+            # The factory publishes the pinned mirror as the seq_lens source
+            # so the metadata build reads exact host values instead of
+            # blocking on a tolist() of the NPU tensor.
+            self._draft_seq_lens_copy_event.synchronize()
+            seq_lens_cpu = self._draft_seq_lens_pinned
         with (
             build_attn_metadata_wrapper(),
             build_attn_metadata_factory(

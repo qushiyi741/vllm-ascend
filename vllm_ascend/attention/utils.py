@@ -456,11 +456,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
-    # The device-side seq_lens is the authoritative KV length and FIA reads
-    # it directly, so the host mirror only serves Python shape/padding work.
-    # Builders must then source the host fields from the CPU mirrors instead
-    # of converting the NPU tensor, which would insert a device-to-host
-    # synchronization into the draft-step critical path.
+    # The draft's exact KV lengths are produced on NPU (rejection-corrected
+    # positions) and staged onto the host by the speculator's early
+    # non-blocking D2H. When set, the host mirrors below already hold those
+    # exact values, so builders must consume them instead of converting the
+    # NPU tensor, which would insert a device-to-host synchronization into
+    # the draft-step critical path.
     use_device_seq_lens: bool = False
 
     # TODO: Remove it when vLLM no longer uses this function.
@@ -752,11 +753,11 @@ def _select_seq_lens(
     across draft iterations, so building from it skips the NPU->CPU sync at
     ``seq_lens.tolist()`` in the metadata build.
 
-    ``use_device_seq_lens`` marks backends whose attention op consumes the
-    device-side lengths directly (FIA v2). Returning the host mirror keeps
-    ``seq_lens.tolist()`` in the metadata build on the CPU side; the
-    parallel_drafting override below would otherwise replace it with the NPU
-    tensor and turn that read into a device synchronization.
+    ``use_device_seq_lens`` marks drafts whose host mirror was refreshed by
+    the speculator's early non-blocking D2H, so the mirror already holds the
+    exact post-rejection lengths. Return it and skip the parallel_drafting
+    override below: that override would re-bind the NPU tensor and turn
+    ``seq_lens.tolist()`` back into a device synchronization.
     """
     use_device_seq_lens = getattr(common_attn_metadata, "use_device_seq_lens", False)
     # Prefer _seq_lens_cpu (always available, updated during draft
@@ -767,8 +768,6 @@ def _select_seq_lens(
         seq_lens = common_attn_metadata._seq_lens_cpu[:num_reqs]
     elif common_attn_metadata.seq_lens_cpu is not None:
         seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
-    elif use_device_seq_lens and common_attn_metadata.seq_lens_cpu_upper_bound is not None:
-        seq_lens = common_attn_metadata.seq_lens_cpu_upper_bound[:num_reqs]
     else:
         seq_lens = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
 
