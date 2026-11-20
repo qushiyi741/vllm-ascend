@@ -155,7 +155,6 @@ class SlidingWindowAdapter:
     ) -> None:
         self.window_size: int = window_size
         self.block_size: int = block_size
-        self.max_num_reqs: int = max_num_reqs
         self.window_blocks = (window_size + block_size - 1) // block_size
         self.max_window_blocks = self.window_blocks + 1
         self._future_offset: int = future_offset
@@ -164,66 +163,31 @@ class SlidingWindowAdapter:
             dtype=torch.int32,
             device=device,
         )
-        # The column indices are independent of the request batch and can be
-        # reused for every draft cache group.  Creating this tensor inside
-        # ``compute_sliding_window_block_table`` used to add an allocator call
-        # to every group on every proposal.
-        self._window_columns = torch.arange(self.max_window_blocks, device=device).unsqueeze(0)
-
-    def new_block_table_buffer(self) -> torch.Tensor:
-        """Allocate an independent output buffer for one cache group.
-
-        A DSpark draft can own several GQA cache groups.  Their physical block
-        ids are different, so their windowed tables must not alias the single
-        scratch buffer used by the one-group EAGLE/DFlash path.
-        """
-        return torch.zeros_like(self._block_table_clone)
-
-    def compute_windowed_seq_lens(
-        self,
-        seq_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the anchor-aligned window start and visible KV lengths.
-
-        The result depends only on the request lengths, not on a cache group's
-        block table.  DSpark reuses it across all of its GQA groups so that the
-        NPU arithmetic is submitted once per proposal.
-        """
-        k_future = self._future_offset
-        w = self.window_size
-        b = self.block_size
-        start_tokens = ((seq_lens + k_future - w).clamp(min=0) // b) * b
-        return start_tokens, seq_lens - start_tokens
 
     def compute_sliding_window_block_table(
         self,
         common_attn_metadata,
         out: torch.Tensor,
-        *,
-        start_tokens: torch.Tensor | None = None,
-        windowed_seq_lens: torch.Tensor | None = None,
-        full_block_table: torch.Tensor | None = None,
     ) -> None:
+        k_future = self._future_offset
+        w = self.window_size
         b = self.block_size
         num_reqs = common_attn_metadata.seq_lens.shape[0]
-        full_block_table = self.full_block_table if full_block_table is None else full_block_table
-        full_cols = full_block_table.shape[1]
+        full_cols = self.full_block_table.shape[1]
 
-        if start_tokens is None or windowed_seq_lens is None:
-            start_tokens, windowed_seq_lens = self.compute_windowed_seq_lens(common_attn_metadata.seq_lens)
         # Window math on the (NPU) seq_lens. Pure arithmetic -> stays on NPU.
-        self.start_tokens_in_window_rounding = start_tokens
-        self._windowed_seq_lens = windowed_seq_lens
+        self.start_tokens_in_window_rounding = ((common_attn_metadata.seq_lens + k_future - w).clamp(min=0) // b) * b
+        self._windowed_seq_lens = common_attn_metadata.seq_lens - self.start_tokens_in_window_rounding
         start_block_indices = self.start_tokens_in_window_rounding // b
 
         # column offset grid [1, max_window_blocks]
-        cols = self._window_columns
+        cols = torch.arange(self.max_window_blocks, device=self.full_block_table.device).unsqueeze(0)
         # source column per (row, col): start_block_indices[:, None] + cols
         src_cols = start_block_indices.unsqueeze(1) + cols
         # clamp to the valid full-block-table column range so gather never goes OOB
         src_cols_clamped = src_cols.clamp(max=full_cols - 1)
 
-        gathered = torch.gather(full_block_table, 1, src_cols_clamped)
+        gathered = torch.gather(self.full_block_table, 1, src_cols_clamped)
 
         needed = torch.clamp((self._windowed_seq_lens + b - 1) // b, max=self.max_window_blocks).unsqueeze(1)
         valid_mask = (cols < needed) & (src_cols < full_cols)
@@ -232,43 +196,18 @@ class SlidingWindowAdapter:
     def apply(
         self,
         common_attn_metadata,
-        *,
-        out: torch.Tensor | None = None,
-        start_tokens: torch.Tensor | None = None,
-        windowed_seq_lens: torch.Tensor | None = None,
-        full_block_table: torch.Tensor | None = None,
-        set_full_block_table: bool = True,
     ) -> None:
-        # ``block_table_tensor`` is replaced by the cropped view below.  Keep
-        # the source table in a local variable before that replacement.  A
-        # DSpark batch can have several GQA groups, each with a different
-        # physical table, so callers may provide the source explicitly.
-        if full_block_table is None:
-            full_block_table = common_attn_metadata.block_table_tensor
-        if set_full_block_table:
-            self.full_block_table = full_block_table
+        self.full_block_table = common_attn_metadata.block_table_tensor
         num_reqs = common_attn_metadata.seq_lens.shape[0]
         k_future = self._future_offset
         w = self.window_size
         b = self.block_size
 
-        if out is None:
-            out = self._block_table_clone
-        self.compute_sliding_window_block_table(
-            common_attn_metadata,
-            out,
-            start_tokens=start_tokens,
-            windowed_seq_lens=windowed_seq_lens,
-            full_block_table=full_block_table,
-        )
-        common_attn_metadata.block_table_tensor = out[:num_reqs]
+        self.compute_sliding_window_block_table(common_attn_metadata, self._block_table_clone)
+        common_attn_metadata.block_table_tensor = self._block_table_clone[:num_reqs]
 
-        # Update NPU seq_lens: reuse the value computed above.  When the
-        # caller supplied a shared result, this avoids recomputing it for the
-        # next cache group.
-        common_attn_metadata.seq_lens = (
-            windowed_seq_lens if windowed_seq_lens is not None else self._windowed_seq_lens
-        )
+        # update NPU seq_lens: reuse the value computed in compute().
+        common_attn_metadata.seq_lens = self._windowed_seq_lens
 
         for name in ("seq_lens_cpu", "_seq_lens_cpu", "seq_lens_cpu_upper_bound"):
             src = getattr(common_attn_metadata, name, None)

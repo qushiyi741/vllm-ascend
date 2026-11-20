@@ -2476,7 +2476,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_computed_tokens_cpu=common_attn_metadata.num_computed_tokens_cpu,
             _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
             seq_lens=common_attn_metadata.seq_lens,
-            use_device_seq_lens=getattr(common_attn_metadata, "use_device_seq_lens", False),
             is_prefilling=common_attn_metadata.is_prefilling,
             max_seq_len=0,
             req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
@@ -2597,23 +2596,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
             else None
         )
-
-        # Window-GQA DSpark owns one physical block table per draft cache
-        # group, but all groups see the same request lengths.  Compute the
-        # device-side window lengths once and keep an independent output table
-        # for every group.  Reusing the old single scratch table both repeated
-        # the NPU arithmetic and allowed a later group to overwrite metadata
-        # retained by an earlier group.
-        shared_window_args = None
-        window_block_table_buffers: dict[int, torch.Tensor] = {}
-        if self.method == "dspark" and self.sliding_window is not None:
-            start_tokens, windowed_seq_lens = self.sliding_window.compute_windowed_seq_lens(
-                common_attn_metadata.seq_lens
-            )
-            shared_window_args = (start_tokens, windowed_seq_lens)
-            window_block_table_buffers = getattr(self, "_window_block_table_buffers", {})
-            self._window_block_table_buffers = window_block_table_buffers
-
         for attn_group in self.draft_attn_groups:
             builder = attn_group.get_metadata_builder()
             device_metadata_provider = (
@@ -2626,45 +2608,26 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 extra_attn_metadata_args["block_size"] = attn_group.kv_cache_spec.block_size
             if self.method == "dspark":
                 gid = attn_group.kv_cache_group_id
-                group_common_attn_metadata = copy.copy(common_attn_metadata)
+                common_attn_metadata = copy.copy(common_attn_metadata)
                 block_table = getattr(self, "_per_group_block_table_buffers", {}).get(gid)
                 if block_table is not None:
-                    group_common_attn_metadata.block_table_tensor = block_table[: group_common_attn_metadata.num_reqs]
+                    common_attn_metadata.block_table_tensor = block_table[: common_attn_metadata.num_reqs]
                 slot_mapping = self._per_group_query_slot_mapping_buffers[gid]
                 if slot_mapping is not None:
-                    group_common_attn_metadata.slot_mapping = slot_mapping[:num_input_tokens]
+                    common_attn_metadata.slot_mapping = slot_mapping[:num_input_tokens]
                 # Apply the sliding window to the per-group block_table + seq_lens
-                # that DSpark's draft FIA actually reads. This group-local copy
-                # bypasses the earlier shared metadata path, so the crop must be
-                # applied here to the physical table owned by this group.
+                # that DSpark's draft FIA actually reads. This branch overwrites
+                # common_attn_metadata.block_table_tensor with the full per-group
+                # table, so the window applied earlier (line 922) is bypassed; we
+                # skipped it there for dspark and re-apply here on the per-group
+                # table so FIA reads the recent-blocks clone instead of block 0.
                 # (dspark only - self.sliding_window is None for MTP.)
                 if self.sliding_window is not None:
-                    window_table = window_block_table_buffers.get(gid)
-                    if window_table is None or window_table.shape != (
-                        self.sliding_window.max_num_reqs,
-                        self.sliding_window.max_window_blocks,
-                    ):
-                        window_table = self.sliding_window.new_block_table_buffer()
-                        window_block_table_buffers[gid] = window_table
-                    start_tokens, windowed_seq_lens = shared_window_args  # type: ignore[misc]
-                    group_common_attn_metadata.use_device_seq_lens = True
-                    full_group_block_table = (
-                        block_table
-                        if block_table is not None
-                        else group_common_attn_metadata.block_table_tensor
-                    )
-                    self.sliding_window.apply(
-                        group_common_attn_metadata,
-                        out=window_table,
-                        start_tokens=start_tokens,
-                        windowed_seq_lens=windowed_seq_lens,
-                        full_block_table=full_group_block_table,
-                        set_full_block_table=gid == getattr(self, "kv_cache_gid", gid),
-                    )
+                    self.sliding_window.apply(common_attn_metadata)
                 if dcp_manager is not None and self.dcp_size > 1:
-                    dcp_manager.prepare_common_attn_metadata(group_common_attn_metadata)
+                    dcp_manager.prepare_common_attn_metadata(common_attn_metadata)
                 attn_metadata = builder.build_for_drafting(
-                    group_common_attn_metadata, draft_index=1, **extra_attn_metadata_args
+                    common_attn_metadata, draft_index=1, **extra_attn_metadata_args
                 )
                 if device_metadata_provider is not None:
                     device_metadata_tasks.extend(device_metadata_provider.take_device_metadata_tasks())
