@@ -149,10 +149,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         draft_vllm_config.model_config.runner_type = self.speculative_config.draft_model_config.runner_type
         return draft_vllm_config
 
-    def _get_draft_forward_vllm_config(self) -> VllmConfig:
-        """Return the config used while executing the draft model."""
-        return self.vllm_config
-
     @staticmethod
     def _get_multimodal_image_token_index(model_name: str, config: Any) -> int | None:
         if model_name in [
@@ -331,7 +327,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # Cache-only backends provide metadata without an attention impl,
         # regardless of the KV cache spec's inheritance hierarchy.
         # Executable backends may resolve their impl from the current config.
-        with set_current_vllm_config(self._get_draft_forward_vllm_config()):
+        with set_current_vllm_config(self.vllm_config):
             return attn_group.backend.get_impl_cls() is None
 
     def _get_primary_draft_attn_group(self) -> Any:
@@ -796,7 +792,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_tokens_across_dp,
             _,
         ) = self.runner._sync_metadata_across_dp(num_tokens, is_draft_model=True)
-        dcp_manager = getattr(self.runner, "dcp_manager", None) if self.dcp_size > 1 else None
+        dcp_manager = getattr(self.runner, "dcp_manager", None)
 
         multi_steps_attn_metadata = []
         if not self.use_cuda_graph:
@@ -880,7 +876,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     req_ids_tensor=req_ids_tensor,
                     token_to_req=token_to_req,
                 )
-                if dcp_manager is not None and self.dcp_size > 1:
+                if dcp_manager is not None:
                     # update long_seq related params and flatten block_table
                     common_attn_metadata.context_parallel_metadata = dcp_manager.long_seq_metadata
 
@@ -911,7 +907,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         num_reqs = common_attn_metadata.num_reqs
                         assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
                         common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:num_reqs]
-                    if dcp_manager is not None and self.dcp_size > 1:
+                    if dcp_manager is not None:
                         dcp_manager.prepare_common_attn_metadata(common_attn_metadata)
                     per_layer_attn_metadata = self._build_multi_group_graph_capture_metadata(
                         common_attn_metadata, draft_index
@@ -970,7 +966,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None,
-            self._get_draft_forward_vllm_config(),
+            self.vllm_config,
             num_tokens=num_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_actual_tokens=0,
@@ -1083,8 +1079,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_decode_reqs=num_decode_reqs,
         )
         assert self.runner is not None
-        dcp_manager = getattr(self.runner, "dcp_manager", None) if self.dcp_size > 1 else None
-        if dcp_manager is not None and self.dcp_size > 1 and not self.parallel_drafting:
+        dcp_manager = getattr(self.runner, "dcp_manager", None)
+        if dcp_manager is not None and not self.parallel_drafting:
             assert long_seq_args is not None
             _, ori_token_indices_to_sample = long_seq_args
 
@@ -1269,7 +1265,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             "slot_indices": None,
             "mtp_slot_mapping": None,
         }
-        if dcp_manager is not None and self.dcp_size > 1 and not self.parallel_drafting:
+        if dcp_manager is not None and not self.parallel_drafting:
             dcp_mtp_inputs = dcp_manager.prepare_spec_decode_mtp_drafting_inputs(
                 common_attn_metadata=common_attn_metadata,
                 attn_metadata=attn_metadata_i,
@@ -1356,7 +1352,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             active_device_metadata_executor = None
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0],
-            self._get_draft_forward_vllm_config(),
+            self.vllm_config,
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             num_actual_tokens=num_tokens,
@@ -1810,7 +1806,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.input_ids[token_indices_to_sample] = next_token_ids
 
             assert self.runner is not None
-            dcp_manager = getattr(self.runner, "dcp_manager", None) if self.dcp_size > 1 else None
+            dcp_manager = getattr(self.runner, "dcp_manager", None)
             long_seq_args = None
             if dcp_manager is not None:
                 first_pass_inputs = dcp_manager.prepare_spec_decode_first_pass_inputs(
@@ -1899,12 +1895,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # The split indexer cache may be the first draft group, but its
             # storage layout is not the main attention cache layout.
             assert len(self.draft_attn_groups) > 0
-            # ``KVCacheSpec.block_size`` is the manager page width.  Ascend
-            # may split that page into several kernel blocks (for example,
-            # 1664 -> 13 x 128 for Window-GQA).  ``compute_new_slot_mapping`` indexes the
-            # expanded kernel-granularity block table, so it must use the
-            # selected kernel width here as well.
-            block_size = self.kernel_block_size
+            block_size = self._get_primary_draft_attn_group().kv_cache_spec.block_size
 
             new_slot_mapping = compute_new_slot_mapping(
                 cad=cad,
@@ -2100,8 +2091,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             common_attn_metadata.positions[:batch_size].copy_(clamped_positions)
 
-        dcp_manager = getattr(self.runner, "dcp_manager", None) if self.dcp_size > 1 else None
-        if dcp_manager is not None and self.dcp_size > 1:
+        dcp_manager = getattr(self.runner, "dcp_manager", None)
+        if dcp_manager is not None:
             kv_cache_spec = getattr(attn_group, "kv_cache_spec", self.draft_attn_groups[0].kv_cache_spec)
             # update slot_mapping
             slot_indices += 1
@@ -2167,7 +2158,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             extra_attn_metadata_args = dict(
                 common_ratio_to_sas_metadata=dict(),
             )
-        if dcp_manager is not None and self.dcp_size > 1:
+        if dcp_manager is not None:
             dcp_manager.prepare_spec_decode_drafting_cp_metadata(
                 common_attn_metadata=common_attn_metadata,
                 kv_cache_spec=kv_cache_spec,
@@ -2496,8 +2487,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.update_stream,
             forward_context,
             num_tokens,
-            self._get_draft_forward_vllm_config(),
-            self._get_draft_forward_vllm_config().speculative_config,
+            self.vllm_config,
+            self.vllm_config.speculative_config,
             draft_attn_metadatas=draft_attn_metadatas,
         )
 
@@ -2585,7 +2576,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # the cache empty in the non-compression path to avoid passing an
         # unexpected argument.
         shared_dsa_draft_cache: dict = dict(common_ratio_to_sas_metadata=dict()) if self.use_compress else {}
-        dcp_manager = getattr(self.runner, "dcp_manager", None) if self.dcp_size > 1 else None
+        dcp_manager = getattr(self.runner, "dcp_manager", None)
         device_metadata_tasks: list[DeviceMetadataTask] = []
         device_metadata_executor = (
             getattr(self.runner, "device_metadata_executor", None)
@@ -2624,7 +2615,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # (dspark only - self.sliding_window is None for MTP.)
                 if self.sliding_window is not None:
                     self.sliding_window.apply(common_attn_metadata)
-                if dcp_manager is not None and self.dcp_size > 1:
+                if dcp_manager is not None:
                     dcp_manager.prepare_common_attn_metadata(common_attn_metadata)
                 attn_metadata = builder.build_for_drafting(
                     common_attn_metadata, draft_index=1, **extra_attn_metadata_args
@@ -2632,7 +2623,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if device_metadata_provider is not None:
                     device_metadata_tasks.extend(device_metadata_provider.take_device_metadata_tasks())
             else:
-                if dcp_manager is not None and self.dcp_size > 1:
+                if dcp_manager is not None:
                     dcp_manager.prepare_common_attn_metadata(common_attn_metadata)
                 attn_metadata = builder.build(
                     0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args
